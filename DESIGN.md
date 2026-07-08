@@ -44,7 +44,7 @@ The operator does not:
 The spec represents the desired state.
 
 ```yaml
-apiVersion: upgrades.example.io/v1alpha1
+apiVersion: upgrades.lunadas.dev/v1alpha1
 kind: ApplicationUpgrade
 metadata:
   name: upgrade-v2

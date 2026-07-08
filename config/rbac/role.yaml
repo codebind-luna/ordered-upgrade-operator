@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - upgrades.lunadas.dev
+  resources:
+  - applicationupgrades
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - upgrades.lunadas.dev
+  resources:
+  - applicationupgrades/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - upgrades.lunadas.dev
+  resources:
+  - applicationupgrades/status
+  verbs:
+  - get
+  - patch
+  - update
