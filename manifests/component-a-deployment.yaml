@@ -1,4 +1,4 @@
-# Component A — Job API (externally-facing).
+# Component A - Job API (externally-facing).
 # Placeholder workload: the container image is a stand-in; only its lifecycle
 # and version metadata matter to the operator.
 apiVersion: apps/v1
@@ -23,7 +23,7 @@ spec:
       app.kubernetes.io/name: job-api
       app.kubernetes.io/component: api
   # Short deadline so a stuck rollout surfaces ProgressDeadlineExceeded
-  # quickly — this is the signal the operator uses to detect a failed upgrade.
+  # quickly - this is the signal the operator uses to detect a failed upgrade.
   progressDeadlineSeconds: 120
   template:
     metadata:

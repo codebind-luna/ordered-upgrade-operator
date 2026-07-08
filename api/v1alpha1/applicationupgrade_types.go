@@ -144,14 +144,14 @@ type ApplicationUpgradeStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
-//+kubebuilder:resource:shortName=appup
-//+kubebuilder:object:root=true
-//+kubebuilder:subresource:status
-//+kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
-//+kubebuilder:printcolumn:name="Worker",type=string,JSONPath=`.status.currentWorkerImage`
-//+kubebuilder:printcolumn:name="API",type=string,JSONPath=`.status.currentAPIImage`
-//+kubebuilder:printcolumn:name="Message",type=string,JSONPath=`.status.message`
-//+kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:resource:shortName=appup
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Worker",type=string,JSONPath=`.status.currentWorkerImage`
+// +kubebuilder:printcolumn:name="API",type=string,JSONPath=`.status.currentAPIImage`
+// +kubebuilder:printcolumn:name="Message",type=string,JSONPath=`.status.message`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // ApplicationUpgrade is the Schema for the applicationupgrades API.
 type ApplicationUpgrade struct {
@@ -162,7 +162,7 @@ type ApplicationUpgrade struct {
 	Status ApplicationUpgradeStatus `json:"status,omitempty"`
 }
 
-//+kubebuilder:object:root=true
+// +kubebuilder:object:root=true
 
 // ApplicationUpgradeList contains a list of ApplicationUpgrade.
 type ApplicationUpgradeList struct {

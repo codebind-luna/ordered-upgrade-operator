@@ -5,8 +5,8 @@
 This operator manages the ordered upgrade of a two-component job
 processing application:
 
-- **Component A** — Job API (externally accessible)
-- **Component B** — Job Worker (internal service)
+- **Component A** - Job API (externally accessible)
+- **Component B** - Job Worker (internal service)
 
 The operator's responsibility is to orchestrate upgrades safely. It does
 not implement the application itself or determine application version
@@ -74,7 +74,7 @@ The namespace on a ref is optional and defaults to the namespace of the
 ApplicationUpgrade. In the common case both components and the CR live in
 one namespace and the field is omitted. Setting it supports a control
 namespace that drives upgrades for apps elsewhere, at the cost of wider
-RBAC — see Security below.
+RBAC - see Security below.
 
 `containerName` is optional. When set, the operator patches that
 container's image. When omitted it patches the sole container in the pod
@@ -134,8 +134,8 @@ The controller watches:
 Deployments are patched rather than individual Pods, allowing
 Kubernetes' native Deployment controller to perform rolling updates.
 
-The operator does not own these Deployments — they pre-exist and are only
-mutated — so no `ownerReference` is set and the usual `Owns()` watch does
+The operator does not own these Deployments - they pre-exist and are only
+mutated - so no `ownerReference` is set and the usual `Owns()` watch does
 not apply. Instead the Deployments are watched with a handler that maps a
 changed Deployment back to any ApplicationUpgrade whose `worker` or `api`
 ref names it (`EnqueueRequestsFromMapFunc`). Because a ref may point at
@@ -170,12 +170,12 @@ component coexist for a window, so the safe order is the one that puts the
 new request contract on the receiving side before any caller can emit it.
 
 Upgrading B first satisfies this. While B rolls out, A is still old and
-sends old requests, which the new B must accept — a backward-compatible
+sends old requests, which the new B must accept - a backward-compatible
 change the release process is responsible for. Once B is fully upgraded, A
 rolls out and its new requests land on a B that already understands them.
 
 The reverse is unsafe. If A upgraded first, its new pods would send
-new-contract requests — an added field, a new endpoint — to an old B that
+new-contract requests - an added field, a new endpoint - to an old B that
 cannot parse them, failing in-flight jobs for the length of the rollout.
 The operator never inspects the contract itself; enforcing
 callee-before-caller ordering is what makes the release process's
@@ -183,19 +183,25 @@ compatibility guarantee hold at runtime.
 
 ### Worker Ready Criteria
 
-Workers are considered ready when the Deployment has fully reconciled:
+Workers are considered ready when the Deployment has fully rolled out, using
+the same criteria as `kubectl rollout status`:
 
-- observedGeneration == generation
-- updatedReplicas == replicas
-- readyReplicas == replicas
-- availableReplicas == replicas
+- observedGeneration >= generation
+- updatedReplicas == desired replicas
+- replicas == updatedReplicas (no old-revision pods remain)
+- availableReplicas == updatedReplicas
+
+The `replicas == updatedReplicas` clause is what makes the ordering sound: it
+holds the upgrade until every old worker pod is gone, not merely until the new
+ones are up, so the API is never upgraded while an old, terminating worker can
+still serve a request.
 
 The `observedGeneration` check is evaluated first and matters most.
 Immediately after the operator patches the Deployment, its status still
 describes the previous revision, so the replica counts can momentarily
 read as "ready" for the pods being replaced. The operator therefore only
 trusts the status once the Deployment controller has observed the patched
-spec — `status.observedGeneration >= metadata.generation` — which avoids
+spec - `status.observedGeneration >= metadata.generation` - which avoids
 concluding the rollout is done before it has begun.
 
 The operator relies on Deployment status rather than individual Pod
@@ -252,13 +258,13 @@ Failure scenarios considered:
 The operator separates configuration errors from transient failures. A
 missing Deployment or an ambiguous container reference cannot be fixed by
 retrying, so the upgrade moves to Failed with a descriptive message and
-stops until the user corrects the spec. Transient errors — a conflicting
-write, a temporary API server outage — are told apart by their error type
+stops until the user corrects the spec. Transient errors - a conflicting
+write, a temporary API server outage - are told apart by their error type
 and left to the reconciler's backoff to retry.
 
-A failed rollout is detected from the Deployment's own conditions —
+A failed rollout is detected from the Deployment's own conditions -
 `Progressing` with reason `ProgressDeadlineExceeded`, or `Available` false
-— rather than by interpreting individual pod states, and is then surfaced
+- rather than by interpreting individual pod states, and is then surfaced
 through the CR's status conditions.
 
 Since reconciliation derives progress entirely from observed cluster
@@ -269,7 +275,7 @@ desired state, and re-plans from what the cluster currently shows.
 
 Deletion uses no finalizer. The operator does not own the Deployments, so
 deleting an ApplicationUpgrade simply stops orchestration and leaves the
-components at their current versions — a deliberate choice, not an
+components at their current versions - a deliberate choice, not an
 oversight.
 
 A single ApplicationUpgrade per application is assumed. Overlapping CRs
@@ -285,7 +291,7 @@ ahead of time; the operator cannot widen its own access at runtime.
 
 Permissions are modelled as a single ClusterRole granting `get` and
 `patch` on Deployments, bound per namespace with a RoleBinding. Defining
-the ClusterRole grants nothing on its own — the operator can act in a
+the ClusterRole grants nothing on its own - the operator can act in a
 namespace only where a RoleBinding for it exists. The set of managed
 namespaces is therefore explicit and auditable: it is exactly the set of
 namespaces carrying that RoleBinding.
@@ -294,7 +300,7 @@ This matters because the ref's namespace is a user-supplied runtime input
 while the grant is an administrator's deploy-time decision, and the two
 can diverge. If a CR references a namespace the operator was never bound
 to, the API returns Forbidden. That is a configuration error, not a
-transient one — retrying cannot help — so the upgrade moves to Failed with
+transient one - retrying cannot help - so the upgrade moves to Failed with
 a message directed at the cluster administrator rather than the app owner.
 
 Cross-namespace references weaken namespace isolation: whoever can create

@@ -8,14 +8,14 @@ metadata:
   name: upgrade-to-1.27
   namespace: job-system
 spec:
-  # Component B — Job Worker. Upgraded first.
+  # Component B - Job Worker. Upgraded first.
   worker:
     deploymentRef:
       name: job-worker
       # namespace omitted: defaults to this ApplicationUpgrade's namespace
     image: nginx:1.27.0
     containerName: worker
-  # Component A — Job API. Upgraded only after the worker is ready.
+  # Component A - Job API. Upgraded only after the worker is ready.
   api:
     deploymentRef:
       name: job-api

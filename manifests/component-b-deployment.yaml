@@ -1,4 +1,4 @@
-# Component B — Job Worker (internal service; upgraded before Component A).
+# Component B - Job Worker (internal service; upgraded before Component A).
 # Placeholder workload: the container image is a stand-in; only its lifecycle
 # and version metadata matter to the operator.
 apiVersion: apps/v1
@@ -21,7 +21,7 @@ spec:
       app.kubernetes.io/name: job-worker
       app.kubernetes.io/component: worker
   # Short deadline so a stuck rollout surfaces ProgressDeadlineExceeded
-  # quickly — the signal the operator uses to detect a failed upgrade.
+  # quickly - the signal the operator uses to detect a failed upgrade.
   progressDeadlineSeconds: 120
   template:
     metadata:
