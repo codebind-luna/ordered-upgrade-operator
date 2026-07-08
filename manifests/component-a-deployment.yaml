@@ -1,0 +1,42 @@
+# Component A — Job API (externally-facing).
+# Placeholder workload: the container image is a stand-in; only its lifecycle
+# and version metadata matter to the operator.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: job-api
+  namespace: job-system
+  labels:
+    app.kubernetes.io/name: job-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: job-processing-system
+    app.kubernetes.io/managed-by: application-upgrade-operator
+    # Human-readable version marker, seeded to match the image tag below.
+    app.kubernetes.io/version: "1.25.3"
+spec:
+  replicas: 1
+  # Selector uses a stable identity subset only. The version label is
+  # intentionally excluded because it changes on upgrade and selectors are
+  # immutable once the Deployment exists.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: job-api
+      app.kubernetes.io/component: api
+  # Short deadline so a stuck rollout surfaces ProgressDeadlineExceeded
+  # quickly — this is the signal the operator uses to detect a failed upgrade.
+  progressDeadlineSeconds: 120
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: job-api
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: job-processing-system
+        app.kubernetes.io/version: "1.25.3"
+    spec:
+      containers:
+        # Container name is fixed; the operator targets it via spec.api.containerName.
+        - name: api
+          # Image TAG is the version source of truth the operator patches on upgrade.
+          image: nginx:1.25.3
+          ports:
+            - containerPort: 80

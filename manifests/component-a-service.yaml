@@ -1,0 +1,19 @@
+# Service for Component A. Selector matches the Deployment's stable identity
+# labels only, so it keeps routing across upgrades that change the version label.
+apiVersion: v1
+kind: Service
+metadata:
+  name: job-api
+  namespace: job-system
+  labels:
+    app.kubernetes.io/name: job-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: job-processing-system
+spec:
+  selector:
+    app.kubernetes.io/name: job-api
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
