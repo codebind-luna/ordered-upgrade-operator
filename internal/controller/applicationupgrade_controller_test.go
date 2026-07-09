@@ -39,8 +39,9 @@ import (
 // and failure behavior deterministically.
 
 const (
-	oldImage = "nginx:1.26.0"
-	newImage = "nginx:1.27.0"
+	oldImage      = "nginx:1.26.0"
+	newImage      = "nginx:1.27.0"
+	recoveryImage = "nginx:1.28.0"
 )
 
 var _ = Describe("ApplicationUpgrade Controller", func() {
@@ -91,6 +92,15 @@ var _ = Describe("ApplicationUpgrade Controller", func() {
 		d.Status.UpdatedReplicas = replicas
 		d.Status.ReadyReplicas = replicas
 		d.Status.AvailableReplicas = replicas
+		// A completed rollout reports Progressing=True/NewReplicaSetAvailable. Set
+		// it explicitly so this also clears any prior ProgressDeadlineExceeded, the
+		// way the real Deployment controller resets the condition when a corrected
+		// spec rolls out - otherwise a recovered Deployment still looks failed.
+		d.Status.Conditions = []appsv1.DeploymentCondition{{
+			Type:   appsv1.DeploymentProgressing,
+			Status: corev1.ConditionTrue,
+			Reason: "NewReplicaSetAvailable",
+		}}
 		Expect(k8sClient.Status().Update(ctx, &d)).To(Succeed())
 	}
 
@@ -241,6 +251,42 @@ var _ = Describe("ApplicationUpgrade Controller", func() {
 			Expect(cr.Status.Phase).To(Equal(upgradesv1alpha1.PhaseFailed))
 			Expect(meta.IsStatusConditionTrue(cr.Status.Conditions, upgradesv1alpha1.ConditionFailed)).To(BeTrue())
 			Expect(imageOf(apiKey)).To(Equal(oldImage), "a failed worker rollout must block the API upgrade")
+		})
+
+		It("recovers when the worker image is corrected after a failed rollout", func() {
+			By("driving the worker rollout to Failed")
+			reconcileOnce() // patches worker to newImage
+			markStuck(workerKey)
+			reconcileOnce()
+			Expect(getCR().Status.Phase).To(Equal(upgradesv1alpha1.PhaseFailed))
+			Expect(imageOf(apiKey)).To(Equal(oldImage))
+
+			By("correcting the image, which re-opens the upgrade at a new generation")
+			cr := getCR()
+			cr.Spec.Worker.Image = recoveryImage
+			cr.Spec.API.Image = recoveryImage
+			Expect(k8sClient.Update(ctx, cr)).To(Succeed())
+
+			By("re-patching the worker with the corrected image")
+			reconcileOnce()
+			Expect(imageOf(workerKey)).To(Equal(recoveryImage))
+
+			By("not re-failing on the previous rollout's stale ProgressDeadlineExceeded")
+			// The worker Deployment still carries the failed condition, and its
+			// observedGeneration now lags the just-patched spec. deploymentFailed
+			// must ignore the condition until the Deployment controller catches up;
+			// without that guard the reconcile would latch Failed forever here.
+			reconcileOnce()
+			Expect(getCR().Status.Phase).To(Equal(upgradesv1alpha1.PhaseWaitingForWorkers),
+				"a corrected rollout must not latch Failed on the previous rollout's condition")
+
+			By("completing the recovery in worker-before-API order")
+			markRolledOut(workerKey)
+			reconcileOnce()
+			Expect(imageOf(apiKey)).To(Equal(recoveryImage))
+			markRolledOut(apiKey)
+			reconcileOnce()
+			Expect(getCR().Status.Phase).To(Equal(upgradesv1alpha1.PhaseCompleted))
 		})
 	})
 

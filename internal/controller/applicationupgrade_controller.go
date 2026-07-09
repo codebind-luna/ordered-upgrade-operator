@@ -108,11 +108,29 @@ func (r *ApplicationUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// Snapshot for a status-only patch at the end. Every branch below mutates
 	// ap.Status in place; this is the single point where it is persisted.
 	base := ap.DeepCopy()
+
+	// A spec change invalidates conditions recorded for the previous generation.
+	// Clear them so the re-plan only reports what it re-verifies this pass; a
+	// failure that exits early (e.g. a stuck worker) would otherwise leave a
+	// stale APIReady=True from the prior generation. The diff against base then
+	// atomically replaces the persisted conditions with the freshly derived set.
+	if ap.Status.ObservedGeneration != ap.Generation {
+		ap.Status.Conditions = nil
+	}
+
 	result, err := r.reconcile(ctx, &ap)
+
+	// Only record this generation as observed when the pass completed without a
+	// transient error. Stamping it after an errored pass can combine with a
+	// stale terminal phase (e.g. a still-Completed status carried over from the
+	// previous generation) to trip the terminal short-circuit above, which would
+	// then skip re-planning the new spec entirely.
+	if err == nil {
+		ap.Status.ObservedGeneration = ap.Generation
+	}
 
 	// Persist status only when it actually changed. Repeated "waiting" passes
 	// re-derive the same status, so the guard skips a no-op API write on each.
-	ap.Status.ObservedGeneration = ap.Generation
 	if !equality.Semantic.DeepEqual(base.Status, ap.Status) {
 		// IgnoreNotFound: the CR may have been deleted mid-reconcile, in which
 		// case there is nothing left to update and no error to report.
@@ -349,7 +367,17 @@ func deploymentReady(d *appsv1.Deployment) bool {
 // deploymentFailed reports a stuck rollout via the Deployment's own Progressing
 // condition. ProgressDeadlineExceeded is the terminal signal; a merely
 // Available=False Deployment is normal mid-rollout and is not treated as failed.
+//
+// Like deploymentReady, the failure signal is only trusted once the Deployment
+// controller has observed the current spec (observedGeneration >= generation).
+// Right after the operator re-patches a Deployment that previously failed - the
+// recovery path, where the user corrects a bad image - its status still carries
+// the old ProgressDeadlineExceeded from the prior rollout. Without this guard the
+// operator would re-fail the recovery it just initiated and latch it terminally.
 func deploymentFailed(d *appsv1.Deployment) (bool, string) {
+	if d.Status.ObservedGeneration < d.Generation {
+		return false, ""
+	}
 	for i := range d.Status.Conditions {
 		c := d.Status.Conditions[i]
 		if c.Type == appsv1.DeploymentProgressing &&
