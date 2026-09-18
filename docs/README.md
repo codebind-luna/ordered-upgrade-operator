@@ -48,6 +48,7 @@ Other useful targets:
 
 ```sh
 make test         # runs the envtest-backed controller specs with coverage
+make test-e2e     # runs the Kind e2e suite (needs a running Kind cluster)
 make lint         # runs golangci-lint
 make docker-build IMG=<registry>/application-upgrade-operator:tag
 ```
@@ -194,12 +195,17 @@ without coupling the operator to the application.
 4. When both are at their desired image and ready, the upgrade reaches
    `Completed`.
 5. If either rollout gets stuck, or the spec is invalid, the upgrade reaches
-   `Failed` with a message and stops until you act.
+   `Failed` with a message explaining which component and why.
 
 Each reconcile performs **at most one transition**, and all progress is derived
 from live cluster state, so the loop is idempotent and safe to resume after a
 controller restart. Editing the spec mid-upgrade bumps the generation and
-re-opens a `Completed`/`Failed` upgrade for another pass.
+re-opens a `Completed` upgrade for another pass.
+
+A `Failed` upgrade needs no such nudge: only `Completed` stops reconciliation,
+so a failed upgrade keeps re-deriving its phase and reports recovery on its own
+if the rollout turns out to be healthy. A configuration error stops until you
+fix the spec, because retrying cannot help.
 
 ### Status you should expect to see
 
@@ -212,7 +218,7 @@ re-opens a `Completed`/`Failed` upgrade for another pass.
 | `UpgradingAPI` | The API Deployment was just patched. |
 | `WaitingForAPI` | Waiting for the API rollout to complete. |
 | `Completed` | Both components are at the desired image and ready. |
-| `Failed` | The upgrade cannot proceed without intervention. |
+| `Failed` | The upgrade cannot currently proceed; re-evaluated each pass. |
 
 **Conditions** (`.status.conditions`), each stamped with the `observedGeneration`
 it was recorded at:
@@ -220,7 +226,7 @@ it was recorded at:
 - `WorkersReady` - true once the worker rollout has fully reconciled.
 - `APIReady` - true once the API rollout has fully reconciled.
 - `Progressing` - true while the operator is actively driving an upgrade.
-- `Failed` - true when the upgrade has entered a terminal failure.
+- `Failed` - true while the upgrade cannot proceed.
 
 **Other fields:** `currentWorkerImage` / `currentAPIImage` report the images the
 operator currently observes on each Deployment; `message` is a human-readable

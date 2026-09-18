@@ -253,6 +253,33 @@ var _ = Describe("ApplicationUpgrade Controller", func() {
 			Expect(imageOf(apiKey)).To(Equal(oldImage), "a failed worker rollout must block the API upgrade")
 		})
 
+		It("does not stay Failed once the rollout recovers on its own", func() {
+			// Regression test for a bug the Kind e2e caught and envtest could not.
+			// Failure is read from a Deployment condition through the informer
+			// cache, and that read can briefly describe a rollout that is already
+			// over - kube publishes the new observedGeneration while Progressing
+			// still reports the previous ReplicaSet's timeout. When Failed was a
+			// terminal state, one such observation stranded an upgrade that was
+			// actually proceeding, with only a spec edit able to re-open it.
+			By("driving the worker rollout to Failed")
+			reconcileOnce() // patches worker
+			markStuck(workerKey)
+			reconcileOnce()
+			Expect(getCR().Status.Phase).To(Equal(upgradesv1alpha1.PhaseFailed))
+
+			By("the rollout turning out to be healthy after all - no spec edit")
+			markRolledOut(workerKey)
+
+			By("the upgrade resumes instead of staying Failed")
+			reconcileOnce()
+			Expect(getCR().Status.Phase).To(Equal(upgradesv1alpha1.PhaseUpgradingAPI))
+			Expect(imageOf(apiKey)).To(Equal(newImage))
+
+			markRolledOut(apiKey)
+			reconcileOnce()
+			Expect(getCR().Status.Phase).To(Equal(upgradesv1alpha1.PhaseCompleted))
+		})
+
 		It("recovers when the worker image is corrected after a failed rollout", func() {
 			By("driving the worker rollout to Failed")
 			reconcileOnce() // patches worker to newImage

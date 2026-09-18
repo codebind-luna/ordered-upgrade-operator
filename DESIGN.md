@@ -229,8 +229,20 @@ HTTP endpoint would be stronger but couples the operator to the
 application; that coupling is deliberately avoided.
 
 If the worker rollout fails, the operator marks the upgrade as
-**Failed**, records the failure in status, and waits for user
-intervention. Automatic rollback is intentionally out of scope.
+**Failed** and records the failure in status. Automatic rollback is
+intentionally out of scope.
+
+`Failed` is a report, not a latch. Only `Completed` short-circuits
+reconciliation; a failed upgrade keeps re-deriving its phase from cluster
+state, so a rollout that recovers is reported as recovered rather than
+staying Failed until someone edits the spec. This matters because failure is
+read from a Deployment condition through the informer cache, and that read can
+briefly describe a rollout that is already over - kube publishes an
+intermediate status carrying the new `observedGeneration` while `Progressing`
+still reports `ProgressDeadlineExceeded` for the previous, already-scaled-down
+ReplicaSet. A terminal decision taken from one such observation would strand an
+upgrade that is in fact proceeding. Configuration errors still stop, because
+retrying genuinely cannot help until the spec changes.
 
 ---
 

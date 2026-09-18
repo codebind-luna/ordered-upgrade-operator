@@ -112,10 +112,20 @@ func (r *ApplicationUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// A terminal upgrade whose spec has not changed needs no further work.
+	// A completed upgrade whose spec has not changed needs no further work.
 	// Comparing observedGeneration to the current generation lets a spec edit
-	// re-open a Completed or Failed upgrade for another pass.
-	if isTerminal(ap.Status.Phase) && ap.Status.ObservedGeneration == ap.Generation {
+	// re-open it for another pass.
+	//
+	// Failed is deliberately NOT short-circuited here. Failure is derived from a
+	// Deployment condition read through the informer cache, and that read can
+	// briefly describe a rollout that is already over: kube publishes an
+	// intermediate status carrying the new observedGeneration while Progressing
+	// still reports ProgressDeadlineExceeded for the previous, already-scaled-down
+	// ReplicaSet. Latching on that observation strands an upgrade that is in fact
+	// proceeding, and nothing short of a spec edit ever re-opens it. Re-evaluating
+	// instead keeps the phase level-triggered: it reports what is true now, and a
+	// rollout that recovers is reported as recovered.
+	if ap.Status.Phase == upgradesv1alpha1.PhaseCompleted && ap.Status.ObservedGeneration == ap.Generation {
 		return ctrl.Result{}, nil
 	}
 
@@ -193,7 +203,8 @@ func (r *ApplicationUpgradeReconciler) reconcile(ctx context.Context, ap *upgrad
 
 	if failed, msg := deploymentFailed(worker); failed {
 		r.markFailed(ap, reasonRolloutFail, "Worker rollout failed: "+msg)
-		return ctrl.Result{}, nil
+		// Requeued, not terminal: see the Completed-only short-circuit above.
+		return ctrl.Result{RequeueAfter: requeueInterval}, nil
 	}
 	if !deploymentReady(worker) {
 		r.setProgress(ap, upgradesv1alpha1.PhaseWaitingForWorkers, "Waiting for worker rollout to complete")
@@ -221,7 +232,7 @@ func (r *ApplicationUpgradeReconciler) reconcile(ctx context.Context, ap *upgrad
 
 	if failed, msg := deploymentFailed(api); failed {
 		r.markFailed(ap, reasonRolloutFail, "API rollout failed: "+msg)
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: requeueInterval}, nil
 	}
 	if !deploymentReady(api) {
 		r.setProgress(ap, upgradesv1alpha1.PhaseWaitingForAPI, "Waiting for API rollout to complete")
@@ -301,9 +312,11 @@ func (r *ApplicationUpgradeReconciler) failOrRequeue(ap *upgradesv1alpha1.Applic
 	return ctrl.Result{}, err
 }
 
-// markFailed records a terminal failure. Callers stop the upgrade by returning
-// an empty result: retrying cannot help until the user changes the spec, which
-// bumps the generation and re-opens the upgrade.
+// markFailed records a failure. For a configuration error the caller stops -
+// retrying cannot help until the user changes the spec. For a rollout timeout
+// the caller requeues instead: the phase reports what the cluster shows now, so
+// a rollout that recovers on its own is reported as recovered rather than
+// staying Failed until someone edits the spec.
 func (r *ApplicationUpgradeReconciler) markFailed(ap *upgradesv1alpha1.ApplicationUpgrade, reason, msg string) {
 	ap.Status.Phase = upgradesv1alpha1.PhaseFailed
 	ap.Status.Message = msg
@@ -343,11 +356,6 @@ func (r *ApplicationUpgradeReconciler) namespaceWatched(ns string) bool {
 	}
 	_, ok := r.WatchNamespaces[ns]
 	return ok
-}
-
-// isTerminal reports whether a phase is an end state.
-func isTerminal(p upgradesv1alpha1.UpgradePhase) bool {
-	return p == upgradesv1alpha1.PhaseCompleted || p == upgradesv1alpha1.PhaseFailed
 }
 
 // containerIndex resolves which container to patch. An unset containerName is
