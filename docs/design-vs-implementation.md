@@ -108,9 +108,10 @@ path in one place and avoids no-op API traffic on every requeue.
   It is belt-and-suspenders, not strictly necessary.
 - **One `ApplicationUpgrade` per application is assumed.** Overlapping CRs
   targeting the same Deployments are treated as user error rather than arbitrated.
-- **The e2e suite is the scaffold.** I invested test effort in the envtest specs,
-  where the ordering and failure logic actually lives, rather than in a Kind-based
-  e2e run.
+- **Failure detection costs one requeue of latency.** A failed rollout is
+  reported from the next reconcile rather than instantly, because the phase is
+  re-derived rather than latched. See the Kind e2e section below for why that
+  matters more than the latency does.
 
 ---
 
@@ -131,7 +132,6 @@ path in one place and avoids no-op API traffic on every requeue.
 - Per-pod failure classification (ImagePullBackOff/CrashLoopBackOff surfaced
   faster than the progress deadline).
 - Application-level version verification over the components' HTTP endpoints.
-- A filled-in Kind e2e suite.
 - Multi-CR arbitration.
 
 ---
@@ -145,8 +145,6 @@ path in one place and avoids no-op API traffic on every requeue.
    deriving all state from the cluster, and the idempotency test exercises it
    indirectly, but a test that reconstructs the reconciler mid-upgrade and
    asserts it resumes correctly would state the guarantee directly.
-3. **A real Kind e2e** that applies the sample against the placeholder manifests
-   and asserts the ordering with a live Deployment controller.
 4. **Optional application-level readiness** - verify the served version over the
    component's HTTP endpoint - as an opt-in behind a spec field, since it trades
    coupling for a stronger guarantee.
@@ -201,6 +199,45 @@ a control namespace may legitimately drive upgrades in other namespaces.
 
 ---
 
+## What the Kind e2e caught that envtest could not
+
+The envtest specs write Deployment status by hand, which is what makes them
+deterministic - and also what makes them blind to statuses a real cluster
+publishes that I would not think to write. Running the same logic against a live
+Deployment controller found a bug that had survived every unit-level test.
+
+**The symptom.** The ordering and stuck-rollout specs passed. The recovery spec -
+correct a bad image, expect the upgrade to finish - timed out after five minutes
+with the upgrade still `Failed`, even though the worker Deployment had reached
+the corrected image and gone `1/1` available.
+
+**The cause.** The failure message named the *broken* ReplicaSet, one the events
+showed had already been scaled to zero. Kube publishes a short-lived
+intermediate status in which `observedGeneration` has advanced to the newly
+patched generation while `Progressing` still reports
+`ProgressDeadlineExceeded` for the previous ReplicaSet. My `observedGeneration`
+guard cannot see this: the object is internally consistent: it simply describes a
+rollout that is over. The reconciler read it as a fresh failure, marked the
+upgrade `Failed`, and because `Failed` was terminal, nothing re-opened it.
+
+Two things about finding it are worth recording. Polling the API with `kubectl`
+every 500ms never reproduced it - the intermediate version is sub-second, and
+only a watch sees every version, which is exactly what the operator's informer
+does. And my first fix was wrong: I tried confirming the timeout on a second
+reconcile, which changed nothing, because both reconciles fired from the same
+watch event and read the same cached object within the same second.
+
+**The fix.** Stop latching. Only `Completed` short-circuits reconciliation now;
+a `Failed` upgrade keeps re-deriving its phase from cluster state, so the phase
+reports what is true now and a rollout that recovers is reported as recovered.
+That removes the whole class of bug rather than the one observation that
+triggered it - no amount of care in reading a condition makes a terminal
+decision safe when it rests on a single sample of a value that changes. The
+regression is pinned by an envtest spec that would have caught the original bug
+had I thought to write it, which is the honest lesson here.
+
+---
+
 ## Known limitations and gaps
 
 - **The `Pending` phase is defined but never set.** The enum includes it, but the
@@ -220,5 +257,7 @@ a control namespace may legitimately drive upgrades in other namespaces.
   invariants encoded as rules but not anything requiring cross-object lookups.
 - **Overlapping CRs are unguarded.** Two `ApplicationUpgrade`s pointing at the
   same Deployments will race; nothing detects or arbitrates that.
-- **e2e is scaffold-only.** Confidence in ordering and failure handling comes
-  from the envtest specs, not from a live end-to-end run.
+- **The e2e proves ordering on one replica.** The Kind suite asserts the
+  invariant against a live Deployment controller, but with `replicas: 1` and a
+  `minReadySeconds` widening the window. Multi-replica rollouts, and rollouts
+  interrupted partway, are not covered.

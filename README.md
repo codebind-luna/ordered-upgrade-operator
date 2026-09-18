@@ -114,13 +114,19 @@ kubectl -n job-system get applicationupgrade -w
 status by hand to assert the ordering, the terminating-old-pod window,
 idempotency, and stuck/missing-Deployment failures deterministically.
 
+`make test-e2e` runs the suite against a live Kind cluster, where a real
+Deployment controller produces the rollout statuses. It asserts the negative the
+unit specs cannot — that the API is *never* patched at any point during the
+worker rollout — and it is what caught the one bug the envtest specs missed
+([write-up](docs/design-vs-implementation.md)).
+
 ## Status
 
 Alpha (`v1alpha1`), and built as a focused exercise rather than a production
 deployment. [`docs/design-vs-implementation.md`](docs/design-vs-implementation.md)
 lists the known limitations honestly — the largest being that failure is
 detected via `ProgressDeadlineExceeded` rather than per-pod classification, and
-that the e2e suite is scaffold-only.
+that the e2e proves the ordering on a single replica.
 
 ## License
 

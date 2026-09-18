@@ -78,9 +78,63 @@ var _ = BeforeSuite(func() {
 			_, _ = fmt.Fprintf(GinkgoWriter, "WARNING: CertManager is already installed. Skipping installation...\n")
 		}
 	}
+
+	// The operator is suite-level infrastructure: every Describe in this suite
+	// needs exactly one running controller, so it is installed once here rather
+	// than per container.
+	By("creating manager namespace")
+	cmd = exec.Command("kubectl", "create", "ns", namespace)
+	if _, err = utils.Run(cmd); err != nil {
+		// An interrupted earlier run can leave the namespace behind. That is not a
+		// reason to fail before a single spec has run, as long as it really is there.
+		cmd = exec.Command("kubectl", "get", "ns", namespace)
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
+	}
+
+	By("labeling the namespace to enforce the restricted security policy")
+	cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
+		"pod-security.kubernetes.io/enforce=restricted")
+	_, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
+
+	By("installing CRDs")
+	cmd = exec.Command("make", "install")
+	_, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
+
+	By("deploying the controller-manager")
+	cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
+	_, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+
+	By("waiting for the controller-manager to be available")
+	cmd = exec.Command("kubectl", "wait", "deployment.apps/application-upgrade-operator-controller-manager",
+		"--for", "condition=Available", "--namespace", namespace, "--timeout", "5m")
+	_, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "controller-manager never became available")
 })
 
 var _ = AfterSuite(func() {
+	// Cluster-scoped, so deleting the namespace below does not remove it. Left
+	// behind, it fails the metrics spec on the next run against the same cluster
+	// with "already exists".
+	By("removing the metrics ClusterRoleBinding")
+	cmd := exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found")
+	_, _ = utils.Run(cmd)
+
+	By("undeploying the controller-manager")
+	cmd = exec.Command("make", "undeploy")
+	_, _ = utils.Run(cmd)
+
+	By("uninstalling CRDs")
+	cmd = exec.Command("make", "uninstall")
+	_, _ = utils.Run(cmd)
+
+	By("removing manager namespace")
+	cmd = exec.Command("kubectl", "delete", "ns", namespace)
+	_, _ = utils.Run(cmd)
+
 	// Teardown CertManager after the suite if not skipped and if it was not already installed
 	if !skipCertManagerInstall && !isCertManagerAlreadyInstalled {
 		_, _ = fmt.Fprintf(GinkgoWriter, "Uninstalling CertManager...\n")
