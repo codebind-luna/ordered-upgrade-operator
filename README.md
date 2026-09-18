@@ -77,6 +77,11 @@ The operator does not own the Deployments — it patches images and lets the
 native Deployment controller perform the rolling update. There is no finalizer
 and no automatic rollback.
 
+Its cost scales with the number of upgrades in flight, not with the size of the
+cluster: a field index resolves a Deployment event to the ApplicationUpgrades
+that reference it, and `--watch-namespaces` scopes the Deployment cache to the
+namespaces the operator is actually bound in.
+
 ## Documentation
 
 - **[`DESIGN.md`](DESIGN.md)** — the design: CRD shape, controller
@@ -99,7 +104,7 @@ make install                              # install the CRD
 kubectl apply -f manifests/namespace.yaml # placeholder two-component app...
 kubectl apply -f manifests/               # ...in the `job-system` namespace
 
-make run                                  # run the operator against your kubeconfig
+make run ARGS="--watch-namespaces=job-system"   # run against your kubeconfig
 
 kubectl apply -f config/samples/upgrades_v1alpha1_applicationupgrade.yaml
 kubectl -n job-system get applicationupgrade -w

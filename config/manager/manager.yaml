@@ -63,6 +63,11 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
+          # Scope the Deployment cache (and the operator's reach) to the
+          # namespaces it is RoleBound in. Omitted here because the managed
+          # namespaces are deployment-specific; without it the operator caches
+          # every Deployment in the cluster.
+          # - --watch-namespaces=job-system
         image: controller:latest
         name: manager
         ports: []

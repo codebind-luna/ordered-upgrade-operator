@@ -51,6 +51,13 @@ const requeueInterval = 10 * time.Second
 // from individual pod states.
 const progressDeadlineExceededReason = "ProgressDeadlineExceeded"
 
+// deploymentRefIndexKey indexes ApplicationUpgrades by the namespaced names of
+// the Deployments they reference. Without it, mapping a Deployment event back to
+// the ApplicationUpgrades that care about it means listing and scanning every
+// ApplicationUpgrade in the cluster on every Deployment event; with it the cache
+// answers with only the matching objects.
+const deploymentRefIndexKey = ".spec.deploymentRefs"
+
 // Condition reasons reported on the ApplicationUpgrade.
 const (
 	reasonUpgrading   = "Upgrading"
@@ -76,6 +83,13 @@ func (e *configError) Error() string { return e.msg }
 type ApplicationUpgradeReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// WatchNamespaces is the set of namespaces the operator may act in. It
+	// mirrors the scope of the manager's Deployment cache: a ref pointing outside
+	// this set could never be served from that cache, so the reconciler rejects it
+	// with an actionable message rather than surfacing an opaque cache miss as a
+	// transient error that retries forever. Empty means cluster-wide.
+	WatchNamespaces map[string]struct{}
 }
 
 // +kubebuilder:rbac:groups=upgrades.lunadas.dev,resources=applicationupgrades,verbs=get;list;watch;create;update;patch;delete
@@ -238,6 +252,16 @@ func (r *ApplicationUpgradeReconciler) getComponentDeployment(
 		ns = ap.Namespace
 	}
 
+	// Checked before the Get so the operator reports the misconfiguration itself
+	// instead of relying on however the cache happens to fail for an unwatched
+	// namespace.
+	if !r.namespaceWatched(ns) {
+		return nil, &configError{fmt.Sprintf(
+			"Deployment %s/%s is outside the operator's watch set; add namespace %q to --watch-namespaces "+
+				"and bind the operator's ClusterRole there",
+			ns, comp.DeploymentRef.Name, ns)}
+	}
+
 	var d appsv1.Deployment
 	if err := r.Get(ctx, types.NamespacedName{Name: comp.DeploymentRef.Name, Namespace: ns}, &d); err != nil {
 		switch {
@@ -309,6 +333,16 @@ func (r *ApplicationUpgradeReconciler) setCondition(
 		Message:            msg,
 		ObservedGeneration: ap.Generation,
 	})
+}
+
+// namespaceWatched reports whether the operator is configured to act in ns. An
+// empty WatchNamespaces means cluster-wide, matching an unscoped cache.
+func (r *ApplicationUpgradeReconciler) namespaceWatched(ns string) bool {
+	if len(r.WatchNamespaces) == 0 {
+		return true
+	}
+	_, ok := r.WatchNamespaces[ns]
+	return ok
 }
 
 // isTerminal reports whether a phase is an end state.
@@ -396,8 +430,16 @@ func deploymentFailed(d *appsv1.Deployment) (bool, string) {
 // SetupWithManager wires the controller. The managed Deployments are not owned
 // by the operator (they pre-exist and are only mutated), so instead of Owns()
 // they are watched with a handler that maps a changed Deployment back to any
-// ApplicationUpgrade whose worker or api ref names it.
-func (r *ApplicationUpgradeReconciler) SetupWithManager(mgr ctrl.Manager) error {
+// ApplicationUpgrade whose worker or api ref names it. That mapping is served by
+// a field index registered here, so it costs a keyed cache lookup rather than a
+// full list per Deployment event.
+func (r *ApplicationUpgradeReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(
+		ctx, &upgradesv1alpha1.ApplicationUpgrade{}, deploymentRefIndexKey, deploymentRefKeys,
+	); err != nil {
+		return fmt.Errorf("indexing ApplicationUpgrade by %s: %w", deploymentRefIndexKey, err)
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&upgradesv1alpha1.ApplicationUpgrade{}).
 		Watches(
@@ -410,30 +452,54 @@ func (r *ApplicationUpgradeReconciler) SetupWithManager(mgr ctrl.Manager) error 
 
 // upgradesForDeployment maps a Deployment event to the ApplicationUpgrades that
 // reference it, so a rollout completing (or failing) re-triggers reconciliation
-// without polling.
+// without polling. The lookup is served by deploymentRefIndexKey: every
+// Deployment in the watched namespaces produces events, and only a vanishing
+// fraction of them are referenced by an ApplicationUpgrade, so scanning every CR
+// per event would make the operator's cost scale with cluster size rather than
+// with the number of upgrades in flight.
 func (r *ApplicationUpgradeReconciler) upgradesForDeployment(ctx context.Context, obj client.Object) []reconcile.Request {
 	var list upgradesv1alpha1.ApplicationUpgradeList
-	if err := r.List(ctx, &list); err != nil {
+	if err := r.List(ctx, &list, client.MatchingFields{
+		deploymentRefIndexKey: deploymentKey(obj.GetNamespace(), obj.GetName()),
+	}); err != nil {
 		logf.FromContext(ctx).Error(err, "listing ApplicationUpgrades for Deployment watch")
 		return nil
 	}
 
-	var requests []reconcile.Request
+	requests := make([]reconcile.Request, 0, len(list.Items))
 	for i := range list.Items {
-		ap := &list.Items[i]
-		refs := []upgradesv1alpha1.DeploymentRef{ap.Spec.Worker.DeploymentRef, ap.Spec.API.DeploymentRef}
-		for _, ref := range refs {
-			ns := ref.Namespace
-			if ns == "" {
-				ns = ap.Namespace
-			}
-			if ref.Name == obj.GetName() && ns == obj.GetNamespace() {
-				requests = append(requests, reconcile.Request{
-					NamespacedName: types.NamespacedName{Name: ap.Name, Namespace: ap.Namespace},
-				})
-				break
-			}
-		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: client.ObjectKeyFromObject(&list.Items[i]),
+		})
 	}
 	return requests
+}
+
+// deploymentRefKeys extracts the index keys for an ApplicationUpgrade: the
+// namespaced name of every Deployment it references. A ref that omits the
+// namespace is resolved against the CR's own namespace - the same defaulting
+// getComponentDeployment applies, so the index and the reconciler always agree
+// on which object a ref denotes.
+func deploymentRefKeys(obj client.Object) []string {
+	ap, ok := obj.(*upgradesv1alpha1.ApplicationUpgrade)
+	if !ok {
+		return nil
+	}
+
+	refs := []upgradesv1alpha1.DeploymentRef{ap.Spec.Worker.DeploymentRef, ap.Spec.API.DeploymentRef}
+	keys := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		ns := ref.Namespace
+		if ns == "" {
+			ns = ap.Namespace
+		}
+		keys = append(keys, deploymentKey(ns, ref.Name))
+	}
+	return keys
+}
+
+// deploymentKey is the single spelling of an index key, used by both the
+// indexer and the lookup so the two cannot drift.
+func deploymentKey(namespace, name string) string {
+	return namespace + "/" + name
 }

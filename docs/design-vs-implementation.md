@@ -155,6 +155,52 @@ path in one place and avoids no-op API traffic on every requeue.
 
 ---
 
+## Changes made after the first pass
+
+Two things I shipped as "correct but not scalable" and came back to. Both are
+about cost rather than correctness, which is why neither showed up in the
+tests - and why both would have shown up in a real cluster.
+
+### The Deployment watch listed every ApplicationUpgrade, per event
+
+`upgradesForDeployment` originally listed *all* ApplicationUpgrades on every
+Deployment event and scanned them for a matching ref. That is fine with three
+CRs and the handful of Deployments in a test namespace. In a cluster with
+thousands of Deployments, almost every event is for a Deployment the operator
+does not manage, and each one paid for a full list and scan - the operator's
+cost scaling with the size of the cluster instead of with the number of upgrades
+in flight.
+
+It is now a field index (`.spec.deploymentRefs`) registered in
+`SetupWithManager`, keyed by the namespaced name of each referenced Deployment,
+so the handler does a keyed cache lookup. The subtlety worth noting: the index
+function has to resolve an omitted ref namespace against the CR's namespace in
+exactly the way the reconciler does, or a cross-namespace upgrade indexes under
+one key and is looked up under another and simply never wakes up. That is what
+the two "explicit ref namespace" specs pin down.
+
+### The cache held every Deployment in the cluster
+
+The manager used the default cluster-wide cache, so the informer cached every
+Deployment in the cluster regardless of RBAC - RBAC constrains what the operator
+may *write*, not what it *watches*, and the cache is the part that costs memory.
+`--watch-namespaces` now scopes the Deployment cache via `cache.Options.ByObject`.
+
+Scoping the cache creates a failure mode that did not exist before: a ref
+pointing outside the watched set can never be served from the cache, and the
+resulting error surfaces from inside the cache in a form that reads as
+transient - so the upgrade would retry forever against a namespace it is
+structurally unable to see. The reconciler therefore checks the watch set
+*before* the Get and fails with a message naming the flag. This is the same
+config-vs-transient distinction as the rest of the error handling, one layer
+earlier; it is the kind of thing that is obvious once the scoping exists and
+invisible before it.
+
+ApplicationUpgrades themselves stay cluster-wide - they are few and small, and
+a control namespace may legitimately drive upgrades in other namespaces.
+
+---
+
 ## Known limitations and gaps
 
 - **The `Pending` phase is defined but never set.** The enum includes it, but the

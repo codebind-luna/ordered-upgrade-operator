@@ -138,9 +138,25 @@ The operator does not own these Deployments - they pre-exist and are only
 mutated - so no `ownerReference` is set and the usual `Owns()` watch does
 not apply. Instead the Deployments are watched with a handler that maps a
 changed Deployment back to any ApplicationUpgrade whose `worker` or `api`
-ref names it (`EnqueueRequestsFromMapFunc`). Because a ref may point at
-another namespace, the manager's cache must be allowed to watch
-Deployments in the managed namespaces rather than only the operator's own.
+ref names it (`EnqueueRequestsFromMapFunc`).
+
+That mapping is backed by a **field index** on ApplicationUpgrade, keyed by
+the namespaced name of each referenced Deployment. Every Deployment in the
+watched namespaces produces events, and all but a handful are irrelevant, so
+resolving each event by listing and scanning every ApplicationUpgrade would
+make the operator's cost scale with the size of the cluster rather than with
+the number of upgrades in flight. The index turns it into a keyed cache
+lookup. The index resolves an omitted ref namespace against the CR's own
+namespace, exactly as the reconciler does, so the two cannot disagree about
+which object a ref denotes.
+
+The manager's cache is scoped to the namespaces the operator is bound in,
+via `--watch-namespaces`. A cluster-wide default cache holds every Deployment
+in the cluster - a large resident set for an operator that touches very few
+of them - and caching is the cost that actually scales, since RBAC constrains
+what may be written but not what is watched. ApplicationUpgrades stay
+cluster-wide: they are few and small, and a control namespace may drive
+upgrades elsewhere.
 
 Each reconciliation performs **at most one state transition**, making
 reconciliation idempotent, event-driven, and resilient to controller
@@ -302,6 +318,15 @@ can diverge. If a CR references a namespace the operator was never bound
 to, the API returns Forbidden. That is a configuration error, not a
 transient one - retrying cannot help - so the upgrade moves to Failed with
 a message directed at the cluster administrator rather than the app owner.
+
+The same divergence exists one layer earlier, at the cache. A ref pointing
+outside `--watch-namespaces` could never be served from the scoped cache, so
+the reconciler checks the watch set *before* issuing the Get and fails the
+upgrade with a message naming the flag to change. Without that check the
+read fails somewhere inside the cache with an error that reads as transient,
+and the upgrade retries forever against a namespace it is structurally
+unable to see. The watch set and the RoleBindings should name the same
+namespaces; they are enforced separately because they fail differently.
 
 Cross-namespace references weaken namespace isolation: whoever can create
 an ApplicationUpgrade can target any namespace the operator is bound to.

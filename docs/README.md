@@ -86,6 +86,22 @@ This runs as your kubeconfig user, so RBAC is not enforced the way it would be
 for the in-cluster ServiceAccount. To run it in-cluster instead, build and push
 an image and use `make deploy IMG=<your-image>`.
 
+#### Scoping which namespaces the operator watches
+
+By default the operator watches Deployments in **every** namespace, which means
+its cache holds every Deployment in the cluster. Scope it to the namespaces you
+have actually bound it in:
+
+```sh
+make run ARGS="--watch-namespaces=job-system,job-system-staging"
+```
+
+An `ApplicationUpgrade` whose `deploymentRef` points outside that set fails
+immediately with a message naming the flag, rather than retrying forever against
+a namespace the operator cannot see. Keep this list and the namespaces carrying
+the operator's RoleBinding in sync - the flag governs what it can *watch*, RBAC
+governs what it can *write*.
+
 ### Create a sample upgrade and observe it
 
 1. **Deploy the two placeholder components.** They are nginx stand-ins in the
