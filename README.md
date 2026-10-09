@@ -5,9 +5,16 @@ A Kubernetes operator that upgrades a **callee before its caller**.
 When two components talk to each other over an internal API, a rolling update
 briefly runs both versions of each at once. If the caller upgrades first, its
 new-contract requests land on a callee that cannot parse them, and every
-in-flight request fails for the length of the rollout. Upgrading the callee
-first — and waiting until *every* old callee pod is gone — is what makes the
-release process's backward-compatibility guarantee hold at runtime.
+in-flight request fails for the length of the rollout.
+
+Compatibility itself is the application developers' contract, not the
+operator's: the new callee must accept requests from the previous caller, while
+the new caller is allowed to depend on the new callee (for example, by sending a
+field the old callee does not know). That one-directional guarantee is only
+sufficient if the callee upgrades first — and *every* old callee pod is gone —
+before the caller moves. The operator enforces that ordering; it does not verify
+compatibility. (A manual rollback reverses the order: caller first, then
+callee.)
 
 This operator enforces that ordering for a two-component job-processing
 application:
