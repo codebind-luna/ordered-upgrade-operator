@@ -1,0 +1,5 @@
+# Only the conversion webhook is served; there are no admission webhooks, so
+# there is no WebhookConfiguration to install - the CRD itself points at this
+# Service (see config/crd/patches).
+resources:
+- service.yaml

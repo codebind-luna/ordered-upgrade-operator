@@ -1,0 +1,28 @@
+# Sample upgrade request. Bumps both components to a new image; the operator
+# rolls the worker first, waits until every old worker pod is gone, then rolls
+# the API, because the API depends on (calls) the worker. Image tags match the
+# placeholder Deployments in manifests/ (nginx stand-ins), so this can be
+# applied end-to-end for a demo.
+#
+# This is the same upgrade as upgrades_v1alpha1_applicationupgrade.yaml written
+# as a v1beta1 dependency graph: v1alpha1's fixed worker/api fields become two
+# components with an explicit dependsOn edge.
+apiVersion: upgrades.lunadas.dev/v1beta1
+kind: ApplicationUpgrade
+metadata:
+  name: upgrade-to-1.27
+  namespace: job-system
+spec:
+  components:
+  - name: worker
+    deploymentRef:
+      name: job-worker
+      # namespace omitted: defaults to this ApplicationUpgrade's namespace
+    image: nginx:1.27.0
+    containerName: worker
+  - name: api
+    deploymentRef:
+      name: job-api
+    image: nginx:1.27.0
+    containerName: api
+    dependsOn: [worker]   # the API calls the worker, so the worker goes first

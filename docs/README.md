@@ -75,6 +75,13 @@ Verify:
 kubectl get crd applicationupgrades.upgrades.lunadas.dev
 ```
 
+The CRD serves two versions: `v1beta1` (storage) and the deprecated `v1alpha1`,
+converted by a webhook inside the operator. `make install` points that webhook
+at the in-cluster Service `make deploy` creates, so with only `make install` +
+`make run`, use `v1beta1`; `v1alpha1` requests need the full `make deploy`
+(which also needs [cert-manager](https://cert-manager.io/)). See
+[`api-versioning.md`](api-versioning.md).
+
 ### Run the operator locally
 
 Run the controller on your host, against the cluster in `~/.kube/config`:
@@ -113,31 +120,46 @@ governs what it can *write*.
    kubectl apply -f manifests/
    ```
 
-2. **Apply an ApplicationUpgrade** that bumps both components to `nginx:1.27.0`:
+2. **Apply an ApplicationUpgrade** that bumps both components to `nginx:1.27.0`.
+   The API calls the worker, so the sample declares `dependsOn: [worker]` on
+   the API component:
 
    ```sh
-   kubectl apply -f config/samples/upgrades_v1alpha1_applicationupgrade.yaml
+   kubectl apply -f config/samples/upgrades_v1beta1_applicationupgrade.yaml
    ```
 
-3. **Watch the upgrade progress.** The printer columns surface the phase and the
-   observed image of each component:
+   The same upgrade in the deprecated two-field form is
+   `config/samples/upgrades_v1alpha1_applicationupgrade.yaml`; applying it
+   needs the conversion webhook, i.e. `make deploy` rather than `make run`.
+
+3. **Watch the upgrade progress** (captured from a Kind cluster):
 
    ```sh
    kubectl -n job-system get applicationupgrade -w
    ```
 
    ```
-   NAME              PHASE              WORKER         API            MESSAGE
-   upgrade-to-1.27   UpgradingWorkers   nginx:1.25.3   <none>         Upgrading workers to nginx:1.27.0
-   upgrade-to-1.27   WaitingForWorkers  nginx:1.27.0   <none>         Waiting for worker rollout to complete
-   upgrade-to-1.27   UpgradingAPI       nginx:1.27.0   nginx:1.25.3   Upgrading API to nginx:1.27.0
-   upgrade-to-1.27   WaitingForAPI      nginx:1.27.0   nginx:1.27.0   Waiting for API rollout to complete
-   upgrade-to-1.27   Completed          nginx:1.27.0   nginx:1.27.0   Upgrade complete
+   NAME              PHASE         MESSAGE                          AGE
+   upgrade-to-1.27                                                  0s
+   upgrade-to-1.27   Progressing   Upgrading worker                 13s
+   upgrade-to-1.27   Progressing   Waiting for worker to complete   13s
+   upgrade-to-1.27   Progressing   Upgrading api                    15s
+   upgrade-to-1.27   Progressing   Waiting for api to complete      15s
+   upgrade-to-1.27   Completed     Upgrade complete                 16s
    ```
 
-   The API column reads `<none>` until the worker is ready, because the operator
-   only records `currentAPIImage` once it reaches Component A - a direct,
-   observable consequence of the B-before-A ordering.
+   Per-component progress - which wave each component is in, its phase, and
+   the image observed on its Deployment - is in `status.components`:
+
+   ```sh
+   kubectl -n job-system get applicationupgrade upgrade-to-1.27 \
+     -o jsonpath='{range .status.components[*]}{.name}{"\t"}wave {.wave}{"\t"}{.phase}{"\t"}{.currentImage}{"\n"}{end}'
+   ```
+
+   ```
+   worker	wave 1	Ready	nginx:1.27.0
+   api	wave 2	Ready	nginx:1.27.0
+   ```
 
 4. **Confirm the ordering held** at any point by reading the live Deployment
    images. The API stays at the old image until the worker rollout is complete:
@@ -186,20 +208,22 @@ without coupling the operator to the application.
 
 ### The upgrade flow, from a user's perspective
 
-1. You create (or edit) an `ApplicationUpgrade` naming the two Deployments and
-   the desired image for each.
-2. The operator patches the **worker** Deployment first and waits for its
-   rollout to finish.
-3. Once the worker is fully rolled out, the operator patches the **API**
-   Deployment and waits for its rollout.
-4. When both are at their desired image and ready, the upgrade reaches
+1. You create (or edit) an `ApplicationUpgrade` listing the components, the
+   desired image for each, and which components each one calls (`dependsOn`).
+2. The operator resolves every component's Deployment and container first; a
+   misconfiguration anywhere - including a dependency cycle - fails the upgrade
+   before anything is patched.
+3. It patches every component whose dependencies are all Ready - initially,
+   those with no dependencies - and waits for their rollouts.
+4. As each rollout completes, the components that were waiting only on it
+   start. For the worker/api sample that is simply worker, then API.
+5. When every component is at its desired image and ready, the upgrade reaches
    `Completed`.
-5. If either rollout gets stuck, or the spec is invalid, the upgrade reaches
-   `Failed` with a message explaining which component and why.
+6. If any rollout gets stuck, or the spec is invalid, the upgrade reaches
+   `Failed` with a message naming the component; no further component starts.
 
-Each reconcile performs **at most one transition**, and all progress is derived
-from live cluster state, so the loop is idempotent and safe to resume after a
-controller restart. Editing the spec mid-upgrade bumps the generation and
+All progress is derived from live cluster state, so the loop is idempotent and
+safe to resume after a controller restart. Editing the spec mid-upgrade bumps the generation and
 re-opens a `Completed` upgrade for another pass.
 
 A `Failed` upgrade needs no such nudge: only `Completed` stops reconciliation,
@@ -209,28 +233,40 @@ fix the spec, because retrying cannot help.
 
 ### Status you should expect to see
 
-**Phases** (`.status.phase`):
+**Phase** (`.status.phase`) - a summary; clients should tolerate values added
+later and act on conditions instead:
 
 | Phase | Meaning |
 |-------|---------|
-| `UpgradingWorkers` | The worker Deployment was just patched. |
-| `WaitingForWorkers` | Waiting for the worker rollout to complete. |
-| `UpgradingAPI` | The API Deployment was just patched. |
-| `WaitingForAPI` | Waiting for the API rollout to complete. |
-| `Completed` | Both components are at the desired image and ready. |
+| `Progressing` | At least one component is being upgraded. |
+| `Completed` | Every component is at its desired image and ready. |
 | `Failed` | The upgrade cannot currently proceed; re-evaluated each pass. |
+
+**Per component** (`.status.components[]`): `wave` (its position in the upgrade
+order), `currentImage` (observed on the Deployment), and `phase`:
+
+| Phase | Meaning |
+|-------|---------|
+| `Pending` | Waiting for its dependencies. |
+| `Upgrading` | Image patched in the latest pass. |
+| `RollingOut` | The new revision is rolling out. |
+| `Ready` | At the desired image, no old-revision pod left. |
+| `Failed` | Its rollout exceeded the progress deadline. |
 
 **Conditions** (`.status.conditions`), each stamped with the `observedGeneration`
 it was recorded at:
 
-- `WorkersReady` - true once the worker rollout has fully reconciled.
-- `APIReady` - true once the API rollout has fully reconciled.
+- `Ready` - true once every component has fully rolled out.
 - `Progressing` - true while the operator is actively driving an upgrade.
 - `Failed` - true while the upgrade cannot proceed.
+- `WorkersReady` / `APIReady` - kept for upgrades that are exactly a worker/api
+  pair, which is every upgrade created through v1alpha1, so existing
+  `kubectl wait --for=condition=...` users keep working.
 
-**Other fields:** `currentWorkerImage` / `currentAPIImage` report the images the
-operator currently observes on each Deployment; `message` is a human-readable
-summary; `observedGeneration` is the spec generation the status reflects.
+Read through v1alpha1, the same object shows the v1alpha1 status:
+`UpgradingWorkers` / `WaitingForWorkers` / `UpgradingAPI` / `WaitingForAPI`
+phases and `currentWorkerImage` / `currentAPIImage`, derived by the conversion
+webhook from the per-component status above.
 
 ### Behavior during error scenarios
 
@@ -270,13 +306,20 @@ this project:
 
 | Path | What's there |
 |------|--------------|
-| **`internal/controller/applicationupgrade_controller.go`** | **The main reconciliation logic** - the ordered B-before-A state machine, readiness/failure evaluation, image patching, status management, and the Deployment watch. |
+| **`internal/controller/applicationupgrade_controller.go`** | **The main reconciliation logic** - dependency-ordered upgrades over the v1beta1 graph, readiness/failure evaluation, image patching, status management, and the Deployment watch. |
+| `internal/dag/` | Kahn's algorithm: upgrade waves from `dependsOn`, and cycle detection. |
+| `internal/controller/applicationupgrade_graph_test.go` | envtest specs for graph ordering, cycles, v1beta1 validation, and v1alpha1 read-modify-write of a graph through the real conversion webhook. |
 | `internal/controller/applicationupgrade_controller_test.go` | envtest specs driving Deployment status by hand to assert ordering, the terminating-old-pod window, idempotency, and failure behavior. |
 | `internal/controller/applicationupgrade_validation_test.go` | Tests for the CRD's declarative (CEL) validation rules. |
 | `internal/controller/suite_test.go` | envtest suite bootstrap. |
-| **`api/v1alpha1/applicationupgrade_types.go`** | **The CRD definition** - `ApplicationUpgrade` spec/status Go types, phases, conditions, and the kubebuilder validation/print-column markers. |
+| **`api/v1beta1/applicationupgrade_types.go`** | **The CRD definition (storage version, conversion hub)** - components, `dependsOn`, per-component status, CEL validation. |
+| `api/v1alpha1/applicationupgrade_types.go` | The deprecated two-component version. |
+| **`api/v1alpha1/applicationupgrade_conversion.go`** | **Conversion to and from v1beta1**, including the annotation that keeps a graph intact through v1alpha1; fuzzed round-trip tests alongside. |
+| `config/policy/` | ValidatingAdmissionPolicy that stops a v1alpha1 write from truncating a graph. |
+| `config/webhook/`, `config/certmanager/` | Conversion webhook Service and its cert-manager serving certificate. |
+| `hack/migrate-storage-version.sh` | Rewrites every object at the storage version and shrinks `storedVersions`. |
 | `config/crd/bases/` | Generated CRD YAML applied by `make install`. |
-| **`config/samples/upgrades_v1alpha1_applicationupgrade.yaml`** | **A ready-to-apply sample** upgrade resource. |
+| **`config/samples/upgrades_v1beta1_applicationupgrade.yaml`** | **A ready-to-apply sample** upgrade resource (the v1alpha1 form sits next to it). |
 | `config/rbac/role.yaml` | Generated operator RBAC (get/list/watch/patch on Deployments, plus the CRD). |
 | `manifests/` | Placeholder two-component application (Deployments/Services in `job-system`) used to demo an upgrade end-to-end. |
 | `cmd/main.go` | Manager entry point (wires the reconciler, metrics, leader election). |

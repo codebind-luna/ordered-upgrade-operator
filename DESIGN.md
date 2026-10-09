@@ -1,5 +1,12 @@
 # Kubernetes Operator for Ordered Upgrades
 
+> This is the original design, written for the two-component `v1alpha1` API.
+> The API has since moved to `v1beta1`, which generalizes the worker/api pair
+> to a dependency graph of N components; the readiness, failure-handling and
+> RBAC reasoning below carries over unchanged. See
+> [`docs/api-versioning.md`](docs/api-versioning.md) for the v1beta1 API, how
+> it converts to and from v1alpha1, and the migration plan.
+
 ## Overview
 
 This operator manages the ordered upgrade of a two-component job

@@ -24,6 +24,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	upgradesv1alpha1 "github.com/codebind-luna/ordered-upgrade-operator/api/v1alpha1"
+	upgradesv1beta1 "github.com/codebind-luna/ordered-upgrade-operator/api/v1beta1"
 )
 
 // These specs assert the CRD's schema validation against a real API server
@@ -47,6 +48,14 @@ func validUpgrade(name string) *upgradesv1alpha1.ApplicationUpgrade {
 			},
 		},
 	}
+}
+
+// asV1beta1 converts a v1alpha1 object to the hub the way the conversion
+// webhook does.
+func asV1beta1(in *upgradesv1alpha1.ApplicationUpgrade) *upgradesv1beta1.ApplicationUpgrade {
+	out := &upgradesv1beta1.ApplicationUpgrade{}
+	Expect(in.ConvertTo(out)).To(Succeed())
+	return out
 }
 
 var _ = Describe("ApplicationUpgrade CRD validation", func() {
@@ -112,6 +121,20 @@ var _ = Describe("ApplicationUpgrade CRD validation", func() {
 
 			By("rejecting a deploymentRef retarget")
 			cr.Spec.Worker.DeploymentRef.Name = "other-worker"
+			Expect(apierrors.IsInvalid(k8sClient.Update(ctx, cr))).To(BeTrue())
+		})
+
+		It("rejects removing an explicit namespace, not just changing it", func() {
+			// A field-level self == oldSelf rule only runs when the field exists on
+			// both sides, so it cannot see the namespace being removed.
+			cr := validUpgrade("immutable-ns-removal")
+			cr.Spec.Worker.DeploymentRef.Namespace = "default"
+			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, cr)).To(Succeed())
+			})
+
+			cr.Spec.Worker.DeploymentRef.Namespace = ""
 			Expect(apierrors.IsInvalid(k8sClient.Update(ctx, cr))).To(BeTrue())
 		})
 	})

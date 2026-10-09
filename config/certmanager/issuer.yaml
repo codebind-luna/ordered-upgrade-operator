@@ -1,0 +1,12 @@
+# Self-signed issuer for the webhook serving certificate. The API server trusts
+# it through the caBundle cert-manager injects into the CRD.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  labels:
+    app.kubernetes.io/name: application-upgrade-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: selfsigned-issuer
+  namespace: system
+spec:
+  selfSigned: {}

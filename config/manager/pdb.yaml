@@ -1,0 +1,18 @@
+# The conversion webhook is on the API server's read path for v1alpha1 and for
+# any object still stored at v1alpha1: if no replica is serving, those GETs,
+# LISTs and WATCHes fail. Keep one replica up through voluntary disruptions
+# (node drains, cluster upgrades).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    app.kubernetes.io/name: application-upgrade-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: controller-manager
+  namespace: system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: application-upgrade-operator

@@ -88,8 +88,19 @@ func imageOf(deployment string) string {
 }
 
 // upgradeField reads one field off the ApplicationUpgrade's status.
+// upgradeField reads through v1alpha1, the version this suite's manifests are
+// written in, so it asserts the v1alpha1 contract end to end - conversion
+// included. The version is pinned on purpose: a bare "applicationupgrade"
+// resolves to the server's preferred version, which became v1beta1, and a
+// script relying on the bare name would silently start reading v1beta1 phases.
+//
+// Only stdout is read: reading v1alpha1 prints a deprecation warning on stderr,
+// which the kubectl helper's combined output would prepend to the value.
 func upgradeField(name, jsonPath string) string {
-	return kubectl("get", "applicationupgrade", name, "-n", appNamespace, "-o", "jsonpath="+jsonPath)
+	out, err := exec.Command("kubectl", "get", "applicationupgrades.v1alpha1.upgrades.lunadas.dev", name,
+		"-n", appNamespace, "-o", "jsonpath="+jsonPath).Output()
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "reading %s of ApplicationUpgrade %s", jsonPath, name)
+	return strings.TrimSpace(string(out))
 }
 
 // applyUpgrade writes an ApplicationUpgrade manifest to a temp file and applies
@@ -228,7 +239,9 @@ var _ = Describe("Ordered upgrade against a live cluster", Ordered, func() {
 			return upgradeField("e2e-stuck", "{.status.phase}")
 		}, 5*time.Minute, 2*time.Second).Should(Equal("Failed"))
 
-		Expect(upgradeField("e2e-stuck", "{.status.message}")).To(ContainSubstring("Worker rollout failed"))
+		// The message names the failing component; it is for humans, so match it
+		// loosely - the phase above is the contract.
+		Expect(strings.ToLower(upgradeField("e2e-stuck", "{.status.message}"))).To(ContainSubstring("worker rollout failed"))
 
 		By("the API was never patched")
 		Expect(imageOf(apiDeploy)).To(Equal(upgradeImage),

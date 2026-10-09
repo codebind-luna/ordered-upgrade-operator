@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -37,6 +38,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	upgradesv1alpha1 "github.com/codebind-luna/ordered-upgrade-operator/api/v1alpha1"
+	upgradesv1beta1 "github.com/codebind-luna/ordered-upgrade-operator/api/v1beta1"
+	"github.com/codebind-luna/ordered-upgrade-operator/internal/dag"
 )
 
 // requeueInterval is a backstop poll while a Deployment rolls out. Watches on
@@ -97,14 +100,14 @@ type ApplicationUpgradeReconciler struct {
 // +kubebuilder:rbac:groups=upgrades.lunadas.dev,resources=applicationupgrades/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;patch
 
-// Reconcile drives an ApplicationUpgrade toward its desired state, upgrading the
-// worker (Component B) before the API (Component A). Each call performs at most
-// one state transition and derives all progress from observed cluster state, so
-// the loop is idempotent and safe to resume after a controller restart.
+// Reconcile drives an ApplicationUpgrade toward its desired state, upgrading
+// every component only after the components it depends on have fully rolled
+// out. All progress is derived from observed cluster state on each pass, so the
+// loop is idempotent and safe to resume after a controller restart.
 func (r *ApplicationUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	var ap upgradesv1alpha1.ApplicationUpgrade
+	var ap upgradesv1beta1.ApplicationUpgrade
 	if err := r.Get(ctx, req.NamespacedName, &ap); err != nil {
 		// NotFound means the CR was deleted mid-flight. There is no finalizer
 		// and the operator does not own the Deployments, so there is nothing to
@@ -125,7 +128,7 @@ func (r *ApplicationUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// proceeding, and nothing short of a spec edit ever re-opens it. Re-evaluating
 	// instead keeps the phase level-triggered: it reports what is true now, and a
 	// rollout that recovers is reported as recovered.
-	if ap.Status.Phase == upgradesv1alpha1.PhaseCompleted && ap.Status.ObservedGeneration == ap.Generation {
+	if ap.Status.Phase == upgradesv1beta1.PhaseCompleted && ap.Status.ObservedGeneration == ap.Generation {
 		return ctrl.Result{}, nil
 	}
 
@@ -134,10 +137,9 @@ func (r *ApplicationUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.R
 	base := ap.DeepCopy()
 
 	// A spec change invalidates conditions recorded for the previous generation.
-	// Clear them so the re-plan only reports what it re-verifies this pass; a
-	// failure that exits early (e.g. a stuck worker) would otherwise leave a
-	// stale APIReady=True from the prior generation. The diff against base then
-	// atomically replaces the persisted conditions with the freshly derived set.
+	// Clear them so the re-plan only reports what it re-verifies this pass. The
+	// diff against base then atomically replaces the persisted conditions with
+	// the freshly derived set.
 	if ap.Status.ObservedGeneration != ap.Generation {
 		ap.Status.Conditions = nil
 	}
@@ -170,83 +172,201 @@ func (r *ApplicationUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.R
 	return result, err
 }
 
-// reconcile contains the ordered state machine. It mutates ap.Status and returns
-// the requeue decision; persistence is handled by the caller.
-func (r *ApplicationUpgradeReconciler) reconcile(ctx context.Context, ap *upgradesv1alpha1.ApplicationUpgrade) (ctrl.Result, error) {
+// target is one component resolved against the cluster for this pass.
+type target struct {
+	spec       upgradesv1beta1.Component
+	deployment *appsv1.Deployment
+	container  int
+}
+
+// reconcile is the ordering logic. It mutates ap.Status and returns the requeue
+// decision; persistence is handled by the caller.
+//
+// It works in three steps. Resolve every component before touching any, so a
+// misconfigured component anywhere in the graph fails the upgrade before a
+// single Deployment is patched. Observe every component's rollout. Only then
+// patch: a component starts once every component it depends on is Ready, and
+// nothing new starts while any component has failed, so a failure stops the
+// upgrade from spreading.
+//
+// Components start as soon as their own dependencies are done, not when their
+// whole wave is: the waves in status are the plan as displayed, while this
+// per-component check is what runs.
+func (r *ApplicationUpgradeReconciler) reconcile(ctx context.Context, ap *upgradesv1beta1.ApplicationUpgrade) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	worker, err := r.getComponentDeployment(ctx, ap, ap.Spec.Worker)
-	if err != nil {
-		return r.failOrRequeue(ap, err)
+	names := make([]string, 0, len(ap.Spec.Components))
+	deps := make(map[string][]string, len(ap.Spec.Components))
+	for _, c := range ap.Spec.Components {
+		names = append(names, c.Name)
+		deps[c.Name] = c.DependsOn
 	}
-	api, err := r.getComponentDeployment(ctx, ap, ap.Spec.API)
+	waves, err := dag.Waves(names, deps)
 	if err != nil {
-		return r.failOrRequeue(ap, err)
+		return r.failOrRequeue(ap, &configError{err.Error()})
 	}
 
-	// ---- Component B: workers. Always upgraded first. ----
-	wIdx, err := containerIndex(worker, ap.Spec.Worker.ContainerName)
-	if err != nil {
-		return r.failOrRequeue(ap, err)
-	}
-	ap.Status.CurrentWorkerImage = worker.Spec.Template.Spec.Containers[wIdx].Image
-
-	if worker.Spec.Template.Spec.Containers[wIdx].Image != ap.Spec.Worker.Image {
-		if err := r.patchImage(ctx, worker, wIdx, ap.Spec.Worker.Image); err != nil {
-			return ctrl.Result{}, err
+	// ---- Resolve: every Deployment and container, before any patch. ----
+	targets := make(map[string]*target, len(names))
+	seen := make(map[string]string, len(names))
+	for _, c := range ap.Spec.Components {
+		d, err := r.getComponentDeployment(ctx, ap, c)
+		if err != nil {
+			return r.failOrRequeue(ap, err)
 		}
-		log.Info("patched worker deployment", "deployment", client.ObjectKeyFromObject(worker), "image", ap.Spec.Worker.Image)
-		r.setProgress(ap, upgradesv1alpha1.PhaseUpgradingWorkers, "Upgrading workers to "+ap.Spec.Worker.Image)
-		r.setCondition(ap, upgradesv1alpha1.ConditionWorkersReady, metav1.ConditionFalse, reasonUpgrading, "Worker image patched")
-		return ctrl.Result{RequeueAfter: requeueInterval}, nil
+		// CEL rejects two components naming the same ref, but it cannot see that
+		// an omitted namespace and an explicit one equal to the CR's are the same
+		// Deployment. Two components patching one Deployment would race.
+		key := deploymentKey(d.Namespace, d.Name)
+		if other, dup := seen[key]; dup {
+			return r.failOrRequeue(ap, &configError{fmt.Sprintf(
+				"components %q and %q both reference Deployment %s", other, c.Name, key)})
+		}
+		seen[key] = c.Name
+
+		idx, err := containerIndex(d, c.ContainerName)
+		if err != nil {
+			return r.failOrRequeue(ap, err)
+		}
+		targets[c.Name] = &target{spec: c, deployment: d, container: idx}
 	}
 
-	if failed, msg := deploymentFailed(worker); failed {
-		r.markFailed(ap, reasonRolloutFail, "Worker rollout failed: "+msg)
+	// ---- Observe: where each component's rollout stands. ----
+	statuses := make(map[string]*upgradesv1beta1.ComponentStatus, len(names))
+	var failures []string
+	for i, wave := range waves {
+		for _, name := range wave {
+			t := targets[name]
+			st := &upgradesv1beta1.ComponentStatus{
+				Name:         name,
+				Wave:         int32(i + 1),
+				CurrentImage: t.deployment.Spec.Template.Spec.Containers[t.container].Image,
+			}
+			statuses[name] = st
+
+			// Failure is checked before readiness: a stuck Deployment can still
+			// report full replica counts left over from its previous revision.
+			failed, msg := deploymentFailed(t.deployment)
+			switch {
+			case st.CurrentImage != t.spec.Image:
+				st.Phase = upgradesv1beta1.ComponentPending
+			case failed:
+				st.Phase = upgradesv1beta1.ComponentFailed
+				failures = append(failures, fmt.Sprintf("%s rollout failed: %s", name, msg))
+			case deploymentReady(t.deployment):
+				st.Phase = upgradesv1beta1.ComponentReady
+			default:
+				st.Phase = upgradesv1beta1.ComponentRollingOut
+			}
+		}
+	}
+
+	// ---- Act: start every component whose dependencies are all Ready. ----
+	var started []string
+	if len(failures) == 0 {
+		for _, wave := range waves {
+			for _, name := range wave {
+				st, t := statuses[name], targets[name]
+				if st.Phase != upgradesv1beta1.ComponentPending || !allReady(statuses, t.spec.DependsOn) {
+					continue
+				}
+				if err := r.patchImage(ctx, t.deployment, t.container, t.spec.Image); err != nil {
+					return ctrl.Result{}, err
+				}
+				log.Info("patched deployment", "component", name,
+					"deployment", client.ObjectKeyFromObject(t.deployment), "image", t.spec.Image)
+				st.Phase = upgradesv1beta1.ComponentUpgrading
+				started = append(started, name)
+			}
+		}
+	}
+
+	// Report components in spec order, so status lines up with what the user wrote.
+	ap.Status.Components = make([]upgradesv1beta1.ComponentStatus, 0, len(names))
+	for _, name := range names {
+		ap.Status.Components = append(ap.Status.Components, *statuses[name])
+	}
+	r.setLegacyConditions(ap)
+
+	switch {
+	case len(failures) > 0:
+		r.markFailed(ap, reasonRolloutFail, strings.Join(failures, "; "))
 		// Requeued, not terminal: see the Completed-only short-circuit above.
 		return ctrl.Result{RequeueAfter: requeueInterval}, nil
-	}
-	if !deploymentReady(worker) {
-		r.setProgress(ap, upgradesv1alpha1.PhaseWaitingForWorkers, "Waiting for worker rollout to complete")
-		r.setCondition(ap, upgradesv1alpha1.ConditionWorkersReady, metav1.ConditionFalse, reasonRollingOut, "Worker rollout in progress")
+	case len(started) > 0:
+		r.setProgress(ap, "Upgrading "+strings.Join(started, ", "))
 		return ctrl.Result{RequeueAfter: requeueInterval}, nil
-	}
-	r.setCondition(ap, upgradesv1alpha1.ConditionWorkersReady, metav1.ConditionTrue, reasonReady, "Workers at desired image and available")
-
-	// ---- Component A: API. Only reached once workers are ready. ----
-	aIdx, err := containerIndex(api, ap.Spec.API.ContainerName)
-	if err != nil {
-		return r.failOrRequeue(ap, err)
-	}
-	ap.Status.CurrentAPIImage = api.Spec.Template.Spec.Containers[aIdx].Image
-
-	if api.Spec.Template.Spec.Containers[aIdx].Image != ap.Spec.API.Image {
-		if err := r.patchImage(ctx, api, aIdx, ap.Spec.API.Image); err != nil {
-			return ctrl.Result{}, err
-		}
-		log.Info("patched api deployment", "deployment", client.ObjectKeyFromObject(api), "image", ap.Spec.API.Image)
-		r.setProgress(ap, upgradesv1alpha1.PhaseUpgradingAPI, "Upgrading API to "+ap.Spec.API.Image)
-		r.setCondition(ap, upgradesv1alpha1.ConditionAPIReady, metav1.ConditionFalse, reasonUpgrading, "API image patched")
+	case !allReady(statuses, names):
+		r.setProgress(ap, "Waiting for "+strings.Join(rollingOut(statuses, names), ", ")+" to complete")
 		return ctrl.Result{RequeueAfter: requeueInterval}, nil
 	}
 
-	if failed, msg := deploymentFailed(api); failed {
-		r.markFailed(ap, reasonRolloutFail, "API rollout failed: "+msg)
-		return ctrl.Result{RequeueAfter: requeueInterval}, nil
-	}
-	if !deploymentReady(api) {
-		r.setProgress(ap, upgradesv1alpha1.PhaseWaitingForAPI, "Waiting for API rollout to complete")
-		r.setCondition(ap, upgradesv1alpha1.ConditionAPIReady, metav1.ConditionFalse, reasonRollingOut, "API rollout in progress")
-		return ctrl.Result{RequeueAfter: requeueInterval}, nil
-	}
-	r.setCondition(ap, upgradesv1alpha1.ConditionAPIReady, metav1.ConditionTrue, reasonReady, "API at desired image and available")
-
-	// Both components are at their desired image and ready.
-	ap.Status.Phase = upgradesv1alpha1.PhaseCompleted
+	ap.Status.Phase = upgradesv1beta1.PhaseCompleted
 	ap.Status.Message = "Upgrade complete"
-	r.setCondition(ap, upgradesv1alpha1.ConditionProgressing, metav1.ConditionFalse, reasonUpgradeDone, "Both components upgraded")
+	r.setCondition(ap, upgradesv1beta1.ConditionReady, metav1.ConditionTrue, reasonReady, "All components upgraded")
+	r.setCondition(ap, upgradesv1beta1.ConditionProgressing, metav1.ConditionFalse, reasonUpgradeDone, "All components upgraded")
 	log.Info("upgrade complete", "applicationupgrade", client.ObjectKeyFromObject(ap))
 	return ctrl.Result{}, nil
+}
+
+func allReady(statuses map[string]*upgradesv1beta1.ComponentStatus, names []string) bool {
+	for _, n := range names {
+		if statuses[n].Phase != upgradesv1beta1.ComponentReady {
+			return false
+		}
+	}
+	return true
+}
+
+// rollingOut names the components whose rollout is in flight - the ones the
+// upgrade is actually waiting on, as opposed to those still queued behind them.
+func rollingOut(statuses map[string]*upgradesv1beta1.ComponentStatus, names []string) []string {
+	var out []string
+	for _, n := range names {
+		if statuses[n].Phase == upgradesv1beta1.ComponentRollingOut {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// legacyConditionTypes are the per-component conditions v1alpha1 objects carry.
+// Condition types are API as much as fields are: `kubectl wait
+// --for=condition=WorkersReady` keeps working for an upgrade created through
+// v1alpha1 only because the controller still sets them for that shape.
+var legacyConditionTypes = map[string]string{
+	upgradesv1alpha1.LegacyWorkerName: upgradesv1alpha1.ConditionWorkersReady,
+	upgradesv1alpha1.LegacyAPIName:    upgradesv1alpha1.ConditionAPIReady,
+}
+
+// setLegacyConditions keeps WorkersReady/APIReady for an upgrade that is the
+// exact worker/api pair a v1alpha1 object converts to. Other graphs report
+// per-component progress in status.components instead.
+func (r *ApplicationUpgradeReconciler) setLegacyConditions(ap *upgradesv1beta1.ApplicationUpgrade) {
+	if !isLegacyPair(ap.Spec) {
+		return
+	}
+	for _, st := range ap.Status.Components {
+		condType := legacyConditionTypes[st.Name]
+		switch st.Phase {
+		case upgradesv1beta1.ComponentReady:
+			r.setCondition(ap, condType, metav1.ConditionTrue, reasonReady, st.Name+" at desired image and available")
+		case upgradesv1beta1.ComponentUpgrading:
+			r.setCondition(ap, condType, metav1.ConditionFalse, reasonUpgrading, st.Name+" image patched")
+		case upgradesv1beta1.ComponentRollingOut:
+			r.setCondition(ap, condType, metav1.ConditionFalse, reasonRollingOut, st.Name+" rollout in progress")
+		}
+	}
+}
+
+func isLegacyPair(spec upgradesv1beta1.ApplicationUpgradeSpec) bool {
+	if len(spec.Components) != 2 {
+		return false
+	}
+	w, a := spec.Components[0], spec.Components[1]
+	return w.Name == upgradesv1alpha1.LegacyWorkerName && len(w.DependsOn) == 0 &&
+		a.Name == upgradesv1alpha1.LegacyAPIName && len(a.DependsOn) == 1 &&
+		a.DependsOn[0] == upgradesv1alpha1.LegacyWorkerName
 }
 
 // getComponentDeployment fetches the Deployment backing a component, resolving
@@ -255,8 +375,8 @@ func (r *ApplicationUpgradeReconciler) reconcile(ctx context.Context, ap *upgrad
 // cluster admin must fix; anything else is treated as transient.
 func (r *ApplicationUpgradeReconciler) getComponentDeployment(
 	ctx context.Context,
-	ap *upgradesv1alpha1.ApplicationUpgrade,
-	comp upgradesv1alpha1.ComponentSpec,
+	ap *upgradesv1beta1.ApplicationUpgrade,
+	comp upgradesv1beta1.Component,
 ) (*appsv1.Deployment, error) {
 	ns := comp.DeploymentRef.Namespace
 	if ns == "" {
@@ -303,7 +423,7 @@ func (r *ApplicationUpgradeReconciler) patchImage(ctx context.Context, deploy *a
 
 // failOrRequeue turns a configuration error into a terminal Failed state and a
 // transient error into a backed-off retry.
-func (r *ApplicationUpgradeReconciler) failOrRequeue(ap *upgradesv1alpha1.ApplicationUpgrade, err error) (ctrl.Result, error) {
+func (r *ApplicationUpgradeReconciler) failOrRequeue(ap *upgradesv1beta1.ApplicationUpgrade, err error) (ctrl.Result, error) {
 	var cfg *configError
 	if errors.As(err, &cfg) {
 		r.markFailed(ap, reasonConfigError, cfg.Error())
@@ -317,24 +437,26 @@ func (r *ApplicationUpgradeReconciler) failOrRequeue(ap *upgradesv1alpha1.Applic
 // the caller requeues instead: the phase reports what the cluster shows now, so
 // a rollout that recovers on its own is reported as recovered rather than
 // staying Failed until someone edits the spec.
-func (r *ApplicationUpgradeReconciler) markFailed(ap *upgradesv1alpha1.ApplicationUpgrade, reason, msg string) {
-	ap.Status.Phase = upgradesv1alpha1.PhaseFailed
+func (r *ApplicationUpgradeReconciler) markFailed(ap *upgradesv1beta1.ApplicationUpgrade, reason, msg string) {
+	ap.Status.Phase = upgradesv1beta1.PhaseFailed
 	ap.Status.Message = msg
-	r.setCondition(ap, upgradesv1alpha1.ConditionFailed, metav1.ConditionTrue, reason, msg)
-	r.setCondition(ap, upgradesv1alpha1.ConditionProgressing, metav1.ConditionFalse, reason, msg)
+	r.setCondition(ap, upgradesv1beta1.ConditionFailed, metav1.ConditionTrue, reason, msg)
+	r.setCondition(ap, upgradesv1beta1.ConditionProgressing, metav1.ConditionFalse, reason, msg)
+	r.setCondition(ap, upgradesv1beta1.ConditionReady, metav1.ConditionFalse, reason, msg)
 }
 
-// setProgress records an in-flight phase and keeps Progressing true.
-func (r *ApplicationUpgradeReconciler) setProgress(ap *upgradesv1alpha1.ApplicationUpgrade, phase upgradesv1alpha1.UpgradePhase, msg string) {
-	ap.Status.Phase = phase
+// setProgress records an in-flight upgrade and keeps Progressing true.
+func (r *ApplicationUpgradeReconciler) setProgress(ap *upgradesv1beta1.ApplicationUpgrade, msg string) {
+	ap.Status.Phase = upgradesv1beta1.PhaseProgressing
 	ap.Status.Message = msg
-	r.setCondition(ap, upgradesv1alpha1.ConditionProgressing, metav1.ConditionTrue, reasonUpgrading, msg)
+	r.setCondition(ap, upgradesv1beta1.ConditionProgressing, metav1.ConditionTrue, reasonUpgrading, msg)
+	r.setCondition(ap, upgradesv1beta1.ConditionReady, metav1.ConditionFalse, reasonUpgrading, msg)
 }
 
 // setCondition upserts a status condition, stamping it with the generation it
 // was observed at so clients can tell fresh conditions from stale ones.
 func (r *ApplicationUpgradeReconciler) setCondition(
-	ap *upgradesv1alpha1.ApplicationUpgrade,
+	ap *upgradesv1beta1.ApplicationUpgrade,
 	condType string,
 	status metav1.ConditionStatus,
 	reason, msg string,
@@ -389,10 +511,10 @@ func containerIndex(d *appsv1.Deployment, name string) (int, error) {
 //   - no old-revision replicas remain (replicas == updatedReplicas); and
 //   - all updated replicas are available (availableReplicas == updatedReplicas).
 //
-// The "no old replicas remain" clause is what makes the B-before-A ordering
-// sound: it holds the upgrade until every old worker pod is gone - not merely
-// until the new ones are up - so the API is never upgraded while an old,
-// terminating worker can still serve a request.
+// The "no old replicas remain" clause is what makes callee-before-caller
+// ordering sound: it holds a dependent until every old pod of its dependency is
+// gone - not merely until the new ones are up - so a new caller is never started
+// while an old, terminating callee can still serve a request.
 func deploymentReady(d *appsv1.Deployment) bool {
 	if d.Status.ObservedGeneration < d.Generation {
 		return false
@@ -438,18 +560,18 @@ func deploymentFailed(d *appsv1.Deployment) (bool, string) {
 // SetupWithManager wires the controller. The managed Deployments are not owned
 // by the operator (they pre-exist and are only mutated), so instead of Owns()
 // they are watched with a handler that maps a changed Deployment back to any
-// ApplicationUpgrade whose worker or api ref names it. That mapping is served by
+// ApplicationUpgrade with a component that references it. That mapping is served by
 // a field index registered here, so it costs a keyed cache lookup rather than a
 // full list per Deployment event.
 func (r *ApplicationUpgradeReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(
-		ctx, &upgradesv1alpha1.ApplicationUpgrade{}, deploymentRefIndexKey, deploymentRefKeys,
+		ctx, &upgradesv1beta1.ApplicationUpgrade{}, deploymentRefIndexKey, deploymentRefKeys,
 	); err != nil {
 		return fmt.Errorf("indexing ApplicationUpgrade by %s: %w", deploymentRefIndexKey, err)
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&upgradesv1alpha1.ApplicationUpgrade{}).
+		For(&upgradesv1beta1.ApplicationUpgrade{}).
 		Watches(
 			&appsv1.Deployment{},
 			handler.EnqueueRequestsFromMapFunc(r.upgradesForDeployment),
@@ -466,7 +588,7 @@ func (r *ApplicationUpgradeReconciler) SetupWithManager(ctx context.Context, mgr
 // per event would make the operator's cost scale with cluster size rather than
 // with the number of upgrades in flight.
 func (r *ApplicationUpgradeReconciler) upgradesForDeployment(ctx context.Context, obj client.Object) []reconcile.Request {
-	var list upgradesv1alpha1.ApplicationUpgradeList
+	var list upgradesv1beta1.ApplicationUpgradeList
 	if err := r.List(ctx, &list, client.MatchingFields{
 		deploymentRefIndexKey: deploymentKey(obj.GetNamespace(), obj.GetName()),
 	}); err != nil {
@@ -489,14 +611,14 @@ func (r *ApplicationUpgradeReconciler) upgradesForDeployment(ctx context.Context
 // getComponentDeployment applies, so the index and the reconciler always agree
 // on which object a ref denotes.
 func deploymentRefKeys(obj client.Object) []string {
-	ap, ok := obj.(*upgradesv1alpha1.ApplicationUpgrade)
+	ap, ok := obj.(*upgradesv1beta1.ApplicationUpgrade)
 	if !ok {
 		return nil
 	}
 
-	refs := []upgradesv1alpha1.DeploymentRef{ap.Spec.Worker.DeploymentRef, ap.Spec.API.DeploymentRef}
-	keys := make([]string, 0, len(refs))
-	for _, ref := range refs {
+	keys := make([]string, 0, len(ap.Spec.Components))
+	for _, c := range ap.Spec.Components {
+		ref := c.DeploymentRef
 		ns := ref.Namespace
 		if ns == "" {
 			ns = ap.Namespace

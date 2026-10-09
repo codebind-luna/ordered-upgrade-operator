@@ -17,4 +17,17 @@ resources:
   kind: ApplicationUpgrade
   path: github.com/codebind-luna/ordered-upgrade-operator/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  domain: lunadas.dev
+  group: upgrades
+  kind: ApplicationUpgrade
+  path: github.com/codebind-luna/ordered-upgrade-operator/api/v1beta1
+  version: v1beta1
+  webhooks:
+    conversion: true
+    spoke:
+    - v1alpha1
+    webhookVersion: v1
 version: "3"
