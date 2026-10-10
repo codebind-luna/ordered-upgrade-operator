@@ -1,0 +1,5 @@
+resources:
+- v1alpha1_shape_guard.yaml
+
+configurations:
+- kustomizeconfig.yaml

@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -116,8 +117,19 @@ var _ = Describe("Manager", Ordered, func() {
 				podOutput, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
 				podNames := utils.GetNonEmptyLines(podOutput)
-				g.Expect(podNames).To(HaveLen(1), "expected 1 controller pod running")
-				controllerPodName = podNames[0]
+				// Two replicas: only the leader reconciles, but both serve the
+				// conversion webhook.
+				g.Expect(podNames).To(HaveLen(2), "expected 2 controller pods running")
+
+				// The specs below read the controller's logs and its reconcile
+				// metrics, which only the leader produces, so they target the
+				// leader: the Lease holder identity is "<pod name>_<uuid>".
+				cmd = exec.Command("kubectl", "get", "lease", "f405dc8f.lunadas.dev",
+					"-o", "jsonpath={.spec.holderIdentity}", "-n", namespace)
+				holder, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "Failed to read the leader election Lease")
+				controllerPodName, _, _ = strings.Cut(holder, "_")
+				g.Expect(podNames).To(ContainElement(controllerPodName), "leader is not a running controller pod")
 				g.Expect(controllerPodName).To(ContainSubstring("controller-manager"))
 
 				// Validate the pod's status
@@ -170,6 +182,15 @@ var _ = Describe("Manager", Ordered, func() {
 			}
 			Eventually(verifyMetricsServerStarted).Should(Succeed())
 
+			// Scrape the leader directly rather than through the Service: the
+			// Service may route to the standby replica, which serves metrics but
+			// has not started the controller, so has no reconcile counters.
+			cmd = exec.Command("kubectl", "get", "pod", controllerPodName,
+				"-o", "jsonpath={.status.podIP}", "-n", namespace)
+			leaderIP, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(leaderIP).NotTo(BeEmpty())
+
 			By("creating the curl-metrics pod to access the metrics endpoint")
 			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
 				"--namespace", namespace,
@@ -181,7 +202,7 @@ var _ = Describe("Manager", Ordered, func() {
 							"name": "curl",
 							"image": "curlimages/curl:latest",
 							"command": ["/bin/sh", "-c"],
-							"args": ["curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics"],
+							"args": ["curl -v -k -H 'Authorization: Bearer %s' https://%s:8443/metrics"],
 							"securityContext": {
 								"allowPrivilegeEscalation": false,
 								"capabilities": {
@@ -196,7 +217,7 @@ var _ = Describe("Manager", Ordered, func() {
 						}],
 						"serviceAccount": "%s"
 					}
-				}`, token, metricsServiceName, namespace, serviceAccountName))
+				}`, token, leaderIP, serviceAccountName))
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
 

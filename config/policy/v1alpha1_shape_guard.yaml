@@ -1,0 +1,53 @@
+# Rejects a write through v1alpha1 that would change the shape of the
+# dependency graph.
+#
+# v1alpha1 can only express a worker/api pair. A v1beta1 graph read through
+# v1alpha1 carries the rest of itself in the upgrades.lunadas.dev/conversion-data
+# annotation, and up-conversion restores the graph from it. A client that drops
+# that annotation - most commonly kubectl apply's three-way merge, after an
+# exported v1alpha1 view was once applied and recorded in last-applied - would
+# have the graph silently truncated to two components on the way back up.
+#
+# Conversion cannot prevent that: the webhook never sees the stored object.
+# Admission can: it sees oldObject, and requestKind says the write arrived as
+# v1alpha1. A v1alpha1 write can never legitimately rename components or change
+# edges, so any such change means the stash was lost, and the write is refused
+# with a pointer to v1beta1. It is CEL evaluated in the API server, so it adds
+# no webhook to keep available.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  labels:
+    app.kubernetes.io/name: application-upgrade-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: v1alpha1-shape-guard
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    matchPolicy: Equivalent
+    resourceRules:
+    - apiGroups: ["upgrades.lunadas.dev"]
+      apiVersions: ["v1beta1"]
+      operations: ["UPDATE"]
+      resources: ["applicationupgrades"]
+  validations:
+  - expression: >-
+      request.requestKind.version != 'v1alpha1' ||
+      (object.spec.components.map(c, c.name) == oldObject.spec.components.map(c, c.name) &&
+       object.spec.components.all(c, oldObject.spec.components.exists(o, o.name == c.name &&
+         (has(o.dependsOn) ? o.dependsOn : []) == (has(c.dependsOn) ? c.dependsOn : []))))
+    message: >-
+      this ApplicationUpgrade has components or dependencies v1alpha1 cannot represent, and this
+      write would replace them; update it through upgrades.lunadas.dev/v1beta1 instead
+    reason: Invalid
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: application-upgrade-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: v1alpha1-shape-guard
+spec:
+  policyName: v1alpha1-shape-guard
+  validationActions: [Deny]

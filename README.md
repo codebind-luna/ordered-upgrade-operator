@@ -16,51 +16,56 @@ before the caller moves. The operator enforces that ordering; it does not verify
 compatibility. (A manual rollback reverses the order: caller first, then
 callee.)
 
-This operator enforces that ordering for a two-component job-processing
-application:
-
-| Component | Role |
-|-----------|------|
-| **Job API** (Component A) | Externally accessible; calls the worker over HTTP |
-| **Job Worker** (Component B) | Internal; **always upgraded first** |
-
-You declare the desired images in one custom resource; the operator drives the
-Deployments there in the correct order, and reports where it got to.
+You declare the components, their images, and which components each one
+calls; the operator upgrades them in dependency order and reports where it got
+to:
 
 ```yaml
-apiVersion: upgrades.lunadas.dev/v1alpha1
+apiVersion: upgrades.lunadas.dev/v1beta1
 kind: ApplicationUpgrade
 metadata:
   name: upgrade-v2
   namespace: job-system
 spec:
-  worker:
-    deploymentRef: { name: job-worker }
-    image: registry.example.com/job-worker:v2.0.0
-    containerName: worker
-  api:
-    deploymentRef: { name: job-api }
-    image: registry.example.com/job-api:v2.0.0
-    containerName: api
+  components:
+  - name: a
+    deploymentRef: { name: app-a }
+    image: registry.example.com/app-a:v2.0.0
+    dependsOn: [b, c]        # a calls b and c
+  - name: b
+    deploymentRef: { name: app-b }
+    image: registry.example.com/app-b:v2.0.0
+    dependsOn: [d]           # b calls d
+  - name: c
+    deploymentRef: { name: app-c }
+    image: registry.example.com/app-c:v2.0.0
+  - name: d
+    deploymentRef: { name: app-d }
+    image: registry.example.com/app-d:v2.0.0
 ```
 
 ```console
-$ kubectl -n job-system get applicationupgrade
-NAME         PHASE               WORKER                     API                     MESSAGE                                  AGE
-upgrade-v2   WaitingForWorkers   job-worker:v2.0.0          job-api:v1.0.0          Waiting for worker rollout to complete   12s
+$ kubectl -n job-system get applicationupgrade upgrade-v2 \
+    -o custom-columns='COMPONENT:.status.components[*].name,WAVE:.status.components[*].wave,PHASE:.status.components[*].phase'
+COMPONENT   WAVE      PHASE
+a,b,c,d     3,2,1,1   Pending,Upgrading,RollingOut,Ready
 ```
+
+The original two-component form - `spec.worker` / `spec.api` in
+`upgrades.lunadas.dev/v1alpha1` - is still served, deprecated, and converts to
+and from the graph form. [`docs/api-versioning.md`](docs/api-versioning.md)
+covers how.
 
 ## How it works
 
-Each reconcile performs **at most one state transition** and derives all
-progress from observed cluster state — nothing is held in memory, so the
-operator resumes correctly after a restart.
-
-```
-Pending -> UpgradingWorkers -> WaitingForWorkers
-        -> UpgradingAPI     -> WaitingForAPI     -> Completed
-                                                 \-> Failed
-```
+The upgrade order comes from `dependsOn` via Kahn's algorithm: waves `[c, d]`,
+`[b]`, `[a]` above. Each reconcile derives every component's progress from
+observed cluster state, nothing is held in memory, so the operator resumes
+correctly after a restart. A component starts as soon as **its own**
+dependencies are done: b starts when d finishes, without waiting for c. All
+components are resolved before any is patched, so a misconfigured component
+anywhere fails the upgrade before it starts, and while any rollout has failed
+nothing new is started.
 
 Three decisions carry most of the correctness:
 
@@ -98,6 +103,10 @@ namespaces the operator is actually bound in.
 - **[`docs/design-vs-implementation.md`](docs/design-vs-implementation.md)** —
   what changed between the design and the code, what surprised me, and the known
   gaps.
+- **[`docs/api-versioning.md`](docs/api-versioning.md)** — the move from
+  v1alpha1 to v1beta1: conversion webhook, the lossy direction and how it is
+  contained, the admission guard, and the storage-migration and deprecation
+  plan.
 
 ## Quick start
 
@@ -113,13 +122,21 @@ kubectl apply -f manifests/               # ...in the `job-system` namespace
 
 make run ARGS="--watch-namespaces=job-system"   # run against your kubeconfig
 
-kubectl apply -f config/samples/upgrades_v1alpha1_applicationupgrade.yaml
+kubectl apply -f config/samples/upgrades_v1beta1_applicationupgrade.yaml
 kubectl -n job-system get applicationupgrade -w
 ```
 
+`make run` runs without the conversion webhook, so only v1beta1 requests work
+locally. `make deploy` installs the full setup - webhook, cert-manager
+certificate, admission policy - and needs
+[cert-manager](https://cert-manager.io/) in the cluster.
+
 `make test` runs the envtest-backed controller specs, which drive Deployment
 status by hand to assert the ordering, the terminating-old-pod window,
-idempotency, and stuck/missing-Deployment failures deterministically.
+idempotency, and stuck/missing-Deployment failures deterministically. The
+original v1alpha1 specs run unchanged through the real conversion webhook, and
+fuzzed round-trip tests check that conversion loses nothing in either
+direction.
 
 `make test-e2e` runs the suite against a live Kind cluster, where a real
 Deployment controller produces the rollout statuses. It asserts the negative the
@@ -129,8 +146,8 @@ worker rollout — and it is what caught the one bug the envtest specs missed
 
 ## Status
 
-Alpha (`v1alpha1`), and built as a focused exercise rather than a production
-deployment. [`docs/design-vs-implementation.md`](docs/design-vs-implementation.md)
+Beta (`v1beta1`, with `v1alpha1` deprecated), and built as a focused exercise
+rather than a production deployment. [`docs/design-vs-implementation.md`](docs/design-vs-implementation.md)
 lists the known limitations honestly — the largest being that failure is
 detected via `ProgressDeadlineExceeded` rather than per-pod classification, and
 that the e2e proves the ordering on a single replica.

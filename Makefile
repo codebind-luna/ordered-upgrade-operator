@@ -97,7 +97,7 @@ build: manifests generate fmt vet ## Build manager binary.
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host. Pass flags with ARGS, e.g. ARGS="--watch-namespaces=job-system".
-	go run ./cmd/main.go $(ARGS)
+	ENABLE_WEBHOOKS=false go run ./cmd/main.go $(ARGS)
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.

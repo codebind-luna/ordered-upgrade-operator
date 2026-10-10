@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	upgradesv1alpha1 "github.com/codebind-luna/ordered-upgrade-operator/api/v1alpha1"
+	upgradesv1beta1 "github.com/codebind-luna/ordered-upgrade-operator/api/v1beta1"
 )
 
 // These specs cover how the operator finds work and how far it is allowed to
@@ -47,13 +48,15 @@ var _ = Describe("Deployment-to-ApplicationUpgrade mapping", func() {
 	)
 
 	// upgradeRefs builds a CR in crNS whose worker and api refs carry the given
-	// namespaces ("" meaning "default to the CR's own namespace").
-	upgradeRefs := func(name, crNS, workerNS, apiNS string) *upgradesv1alpha1.ApplicationUpgrade {
+	// namespaces ("" meaning "default to the CR's own namespace"). It is written
+	// as v1alpha1 for brevity and converted, since the controller indexes the
+	// v1beta1 hub and a fake client performs no conversion.
+	upgradeRefs := func(name, crNS, workerNS, apiNS string) *upgradesv1beta1.ApplicationUpgrade {
 		cr := validUpgrade(name)
 		cr.Namespace = crNS
 		cr.Spec.Worker.DeploymentRef.Namespace = workerNS
 		cr.Spec.API.DeploymentRef.Namespace = apiNS
-		return cr
+		return asV1beta1(cr)
 	}
 
 	// newReconciler wires a fake client carrying the same index the manager
@@ -61,7 +64,7 @@ var _ = Describe("Deployment-to-ApplicationUpgrade mapping", func() {
 	newReconciler := func(objs ...client.Object) *ApplicationUpgradeReconciler {
 		builder := fake.NewClientBuilder().
 			WithScheme(k8sClient.Scheme()).
-			WithIndex(&upgradesv1alpha1.ApplicationUpgrade{}, deploymentRefIndexKey, deploymentRefKeys)
+			WithIndex(&upgradesv1beta1.ApplicationUpgrade{}, deploymentRefIndexKey, deploymentRefKeys)
 		for _, o := range objs {
 			builder = builder.WithObjects(o)
 		}
@@ -99,8 +102,8 @@ var _ = Describe("Deployment-to-ApplicationUpgrade mapping", func() {
 		It("enqueues only the ApplicationUpgrades referencing the changed Deployment", func() {
 			matching := upgradeRefs("matching", appNS, "", "")
 			unrelated := upgradeRefs("unrelated", appNS, "", "")
-			unrelated.Spec.Worker.DeploymentRef.Name = "other-worker"
-			unrelated.Spec.API.DeploymentRef.Name = "other-api"
+			unrelated.Spec.Components[0].DeploymentRef.Name = "other-worker"
+			unrelated.Spec.Components[1].DeploymentRef.Name = "other-api"
 
 			r := newReconciler(matching, unrelated)
 

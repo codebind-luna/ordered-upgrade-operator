@@ -44,6 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	upgradesv1alpha1 "github.com/codebind-luna/ordered-upgrade-operator/api/v1alpha1"
+	upgradesv1beta1 "github.com/codebind-luna/ordered-upgrade-operator/api/v1beta1"
 	"github.com/codebind-luna/ordered-upgrade-operator/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
@@ -57,6 +58,7 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(upgradesv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(upgradesv1beta1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -246,6 +248,18 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "ApplicationUpgrade")
 		os.Exit(1)
 	}
+	// The conversion webhook serves /convert for the API server. It is on the
+	// read path of every v1alpha1 request - and of LISTs that include objects
+	// still stored at v1alpha1 - so it ships in the same binary as the
+	// controller and is up whenever the controller is. ENABLE_WEBHOOKS=false is
+	// for running locally against a cluster without webhook certificates; only
+	// v1beta1 requests work then.
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err = ctrl.NewWebhookManagedBy(mgr).For(&upgradesv1beta1.ApplicationUpgrade{}).Complete(); err != nil {
+			setupLog.Error(err, "unable to create conversion webhook", "webhook", "ApplicationUpgrade")
+			os.Exit(1)
+		}
+	}
 	// +kubebuilder:scaffold:builder
 
 	if metricsCertWatcher != nil {
@@ -271,6 +285,15 @@ func main() {
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
+	}
+	// Keep a replica out of the webhook Service until it is actually serving
+	// /convert, so a rollout of the operator never routes conversions to a pod
+	// that would refuse them.
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err := mgr.AddReadyzCheck("webhook", mgr.GetWebhookServer().StartedChecker()); err != nil {
+			setupLog.Error(err, "unable to set up webhook ready check")
+			os.Exit(1)
+		}
 	}
 
 	setupLog.Info("starting manager")

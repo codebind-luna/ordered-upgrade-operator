@@ -21,6 +21,10 @@ import (
 )
 
 // DeploymentRef identifies a Deployment the operator manages.
+// The struct-level rule closes a gap the field-level rules leave open: a
+// transition rule only runs when the field exists on both sides, so removing an
+// optional namespace would otherwise slip past "namespace is immutable".
+// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="deploymentRef is immutable"
 type DeploymentRef struct {
 	// Name of the target Deployment. Must be a valid DNS-1123 subdomain and is
 	// immutable once set.
@@ -146,6 +150,7 @@ type ApplicationUpgradeStatus struct {
 
 // +kubebuilder:resource:shortName=appup
 // +kubebuilder:object:root=true
+// +kubebuilder:deprecatedversion:warning="upgrades.lunadas.dev/v1alpha1 ApplicationUpgrade is deprecated; use upgrades.lunadas.dev/v1beta1"
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Worker",type=string,JSONPath=`.status.currentWorkerImage`
